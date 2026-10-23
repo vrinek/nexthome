@@ -32,8 +32,10 @@ driven by the customer's own AI over MCP.
 - **Support agent.** Not in this version. A `report_issue` tool stores the
   message; it is the hook for the software factory later.
 - **Hosting.** Rust binary as a systemd service in a VM on vrnk's hardware,
-  Postgres in the same VM, Cloudflare tunnel in front. No containers.
-- **Stack.** axum, sqlx + Postgres, official Rust MCP SDK (`rmcp`),
+  SQLite file on the VM's disk with a nightly copy, Cloudflare tunnel in
+  front. No containers, no database daemon.
+- **Stack.** axum, sqlx + SQLite in WAL mode (one process is the only
+  writer; the job loop runs inside it), official Rust MCP SDK (`rmcp`),
   `async-stripe`, askama templates, `geo` crate for polygon set operations
   (replaces the Python shapely scripts). Mapbox GL JS on the map page as today.
 - **Dropped in the port.** The four listing importers (the mover's AI reads
@@ -85,7 +87,7 @@ locations       id, relocation_id, place_type_id, member_id, name, lat, lon,
                 (unique relocation_id + source_url, unique relocation_id +
                 external_identifier)
 isochrones      id, location_id, minutes, geojson
-evaluations     id, location_id, computed_at, rows (jsonb: place_type,
+evaluations     id, location_id, computed_at, rows (JSON text: place_type,
                 destination_location_id, walk, bike, transit, car minutes)
 jobs            id, kind, payload, run_after, attempts, last_error, done_at
 api_usage       id, relocation_id, provider ('mapbox'|'google'), month, calls
@@ -148,9 +150,9 @@ acceptance criterion throughout.
 
 ### 1. Repository skeleton
 New crate `nexthome`, AGPL-3.0 LICENSE, axum server with `/healthz`, sqlx
-with Postgres and migrations directory, `cargo test` running against a test
-database (`DATABASE_URL`), CI running fmt, clippy, test. Done when CI is green
-on an empty app.
+with SQLite (WAL mode, foreign keys on) and a migrations directory, tests
+running against a temporary database file each, CI running fmt, clippy, test
+with no services. Done when CI is green on an empty app.
 
 ### 2. Schema and migrations
 The tables above as sqlx migrations, with the constraints listed. Done when
@@ -183,8 +185,9 @@ Clients from task 5 call it before every request. Done when tests cover both
 caps hit and not hit.
 
 ### 7. Background jobs
-`jobs` table, a tokio loop that claims one job at a time with
-`FOR UPDATE SKIP LOCKED`, retries with backoff up to 5 attempts, records
+`jobs` table, a tokio loop that claims one job at a time with a single
+`UPDATE ... WHERE id = (SELECT ... LIMIT 1) RETURNING *` (SQLite has one
+writer, so this is atomic), retries with backoff up to 5 attempts, records
 `last_error`. Job kinds: `isochrones(location_id)`, `populate(relocation_id,
 place_type_id, lat, lon)`, `archive_expired`. Done when tests cover claim,
 retry and completion.
@@ -249,15 +252,15 @@ the prompt text and the `/ai` page mention every tool name registered in the
 server.
 
 ### 16. Deployment
-VM image or shell script: Postgres, the binary as a systemd unit,
-`cloudflared` tunnel, nightly `pg_dump` to a second disk, env file for
-secrets (Mapbox, Google, Stripe, SMTP). Done when a fresh VM comes up and
+VM image or shell script: the binary as a systemd unit, `cloudflared`
+tunnel, nightly `sqlite3 .backup` to a second disk, env file for secrets
+(Mapbox, Google, Stripe, SMTP). Done when a fresh VM comes up and
 `/healthz` is reachable through the tunnel.
 
 ### 17. Data migration from the Rails app
-One-off script: read `db/production.sqlite3`, create vrnk's account with two
-members and one relocation per city, copy place types, locations and
-isochrones. Done when counts match and the map renders the Berlin data.
+One-off script: read the Rails `db/production.sqlite3` (same engine), create
+vrnk's account with two members and one relocation per city, copy place
+types, locations and isochrones. Done when counts match and the map renders the Berlin data.
 
 ### 18. OAuth 2.1
 Authorization server endpoints with dynamic client registration and PKCE,
