@@ -31,9 +31,12 @@ driven by the customer's own AI over MCP.
   fair-use cap per relocation; tools refuse with a clear message past either.
 - **Support agent.** Not in this version. A `report_issue` tool stores the
   message; it is the hook for the software factory later.
-- **Hosting.** Rust binary as a systemd service in a VM on vrnk's hardware,
-  SQLite file on the VM's disk with a nightly copy, Cloudflare tunnel in
-  front. No containers, no database daemon.
+- **Hosting.** One Fly.io Machine (a Firecracker VM) running the Rust binary,
+  with a Fly volume holding the SQLite file. Fly snapshots the volume daily.
+  Deploy is `fly deploy` from GitHub Actions on push to main, so the factory
+  ships to production without a human. No database daemon, nothing on vrnk's
+  hardware. Fly's MCP server (mcp.fly.io) lets an AI operate the
+  infrastructure.
 - **Stack.** axum, sqlx + SQLite in WAL mode (one process is the only
   writer; the job loop runs inside it), official Rust MCP SDK (`rmcp`),
   `async-stripe`, askama templates, `geo` crate for polygon set operations
@@ -251,11 +254,16 @@ marketing page with the copy-this-prompt button. Done when a test asserts
 the prompt text and the `/ai` page mention every tool name registered in the
 server.
 
-### 16. Deployment
-VM image or shell script: the binary as a systemd unit, `cloudflared`
-tunnel, nightly `sqlite3 .backup` to a second disk, env file for secrets
-(Mapbox, Google, Stripe, SMTP). Done when a fresh VM comes up and
-`/healthz` is reachable through the tunnel.
+### 16. Deployment to Fly.io
+A two-stage Dockerfile that builds the release binary and copies it into a
+minimal image; `fly.toml` with one machine, one volume mounted at the
+directory `DATABASE_URL` points into, HTTPS forced, and a health check on
+`/healthz`; secrets (Mapbox, Google, Stripe, SMTP) set with `fly secrets`,
+never in the repo; a GitHub Actions job that runs `fly deploy` on push to
+main after CI passes, using a deploy token stored as a repository secret;
+a post-deploy step that curls `/healthz` and fails the job on anything but
+200. Done when a merge to main deploys itself and the health check passes
+on the Fly URL.
 
 ### 17. Data migration from the Rails app
 One-off script: read the Rails `db/production.sqlite3` (same engine), create
