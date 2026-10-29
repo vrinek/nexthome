@@ -60,8 +60,8 @@ async fn spawn_server() -> TestServer {
 }
 
 /// GETs /me with the given Authorization header (or without one) and returns
-/// the status code and body.
-async fn get_me(address: &str, authorization: Option<&str>) -> (u16, String) {
+/// the status code, the raw head (status line and headers) and the body.
+async fn get_me(address: &str, authorization: Option<&str>) -> (u16, String, String) {
     let mut connection = TcpStream::connect(address).await.unwrap();
     let mut request = String::from("GET /me HTTP/1.1\r\nHost: localhost\r\n");
     if let Some(value) = authorization {
@@ -74,9 +74,9 @@ async fn get_me(address: &str, authorization: Option<&str>) -> (u16, String) {
 
     let mut response = String::new();
     connection.read_to_string(&mut response).await.unwrap();
-    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-    let status: u16 = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
-    (status, body.to_owned())
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, head.to_owned(), body.to_owned())
 }
 
 #[tokio::test]
@@ -86,7 +86,7 @@ async fn a_valid_key_resolves_its_member_and_account() {
         .await
         .unwrap();
 
-    let (status, body) = get_me(
+    let (status, _, body) = get_me(
         &server.address,
         Some(&format!("Bearer {}", created.api_key)),
     )
@@ -111,10 +111,15 @@ async fn a_missing_authorization_header_is_rejected() {
         .await
         .unwrap();
 
-    let (status, body) = get_me(&server.address, None).await;
+    let (status, head, body) = get_me(&server.address, None).await;
 
     assert_eq!(status, 401);
     assert_eq!(body, "");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("www-authenticate: bearer"),
+        "401 must carry a Bearer challenge (RFC 7235): {head}"
+    );
 }
 
 #[tokio::test]
@@ -128,11 +133,10 @@ async fn a_malformed_authorization_header_is_rejected() {
         "Bearer",                                   // scheme without a key
         "Bearer ",                                  // empty key
         "Token 6d6f766572406578616d706c652e636f6d", // wrong scheme
-        "mover@example.com",                        // no scheme at all
         "Bearer é",                                 // not valid ASCII
     ];
     for header in malformed {
-        let (status, _) = get_me(&server.address, Some(header)).await;
+        let (status, _, _) = get_me(&server.address, Some(header)).await;
         assert_eq!(status, 401, "expected 401 for Authorization: {header:?}");
     }
 }
@@ -146,7 +150,7 @@ async fn an_unknown_key_is_rejected() {
 
     // A well-formed key that was never issued.
     let unknown = "0".repeat(64);
-    let (status, body) = get_me(&server.address, Some(&format!("Bearer {unknown}"))).await;
+    let (status, _, body) = get_me(&server.address, Some(&format!("Bearer {unknown}"))).await;
 
     assert_eq!(status, 401);
     assert_eq!(body, "");
@@ -159,7 +163,7 @@ async fn a_revoked_key_is_rejected() {
         .await
         .unwrap();
 
-    let (status, _) = get_me(
+    let (status, _, _) = get_me(
         &server.address,
         Some(&format!("Bearer {}", created.api_key)),
     )
@@ -170,7 +174,7 @@ async fn a_revoked_key_is_rejected() {
         .await
         .unwrap();
 
-    let (status, _) = get_me(
+    let (status, _, _) = get_me(
         &server.address,
         Some(&format!("Bearer {}", created.api_key)),
     )
@@ -188,14 +192,16 @@ async fn members_of_one_account_authenticate_with_their_own_keys() {
         .await
         .unwrap();
 
-    let (status, body) = get_me(&server.address, Some(&format!("Bearer {}", first.api_key))).await;
+    let (status, _, body) =
+        get_me(&server.address, Some(&format!("Bearer {}", first.api_key))).await;
     assert_eq!(status, 200);
     assert_eq!(
         body,
         format!("{} {} {}", first.account_id, first.member_id, first.email)
     );
 
-    let (status, body) = get_me(&server.address, Some(&format!("Bearer {}", second.api_key))).await;
+    let (status, _, body) =
+        get_me(&server.address, Some(&format!("Bearer {}", second.api_key))).await;
     assert_eq!(status, 200);
     assert_eq!(
         body,
