@@ -1,0 +1,24 @@
+{
+  "results": [
+    {
+      "address_components": [
+        { "long_name": "10", "short_name": "10", "types": ["street_number"] },
+        { "long_name": "Inselstraße", "short_name": "Inselstraße", "types": ["route"] },
+        { "long_name": "Berlin", "short_name": "Berlin", "types": ["locality", "political"] },
+        { "long_name": "Germany", "short_name": "DE", "types": ["country", "political"] }
+      ],
+      "formatted_address": "Inselstraße 10, 10179 Berlin, Germany",
+      "geometry": {
+        "location": { "lat": 52.5106, "lng": 13.4106 },
+        "location_type": "ROOFTOP",
+        "viewport": {
+          "northeast": { "lat": 52.51195, "lng": 13.412 },
+          "southwest": { "lat": 52.50925, "lng": 13.4092 }
+        }
+      },
+      "place_id": "ChIJc1XMJKuRqEcR2XsH0m9uX",
+      "types": ["street_address"]
+    }
+  ],
+  "status": "OK"
+}

@@ -1,0 +1,19 @@
+{
+  "id": "ChIJN1t_tDeuEmsRUsoyG83frY4",
+  "businessStatus": "OPERATIONAL",
+  "displayName": {
+    "text": "Berlin Cosmopolitan School",
+    "languageCode": "en"
+  },
+  "location": {
+    "latitude": 52.5267634,
+    "longitude": 13.407897
+  },
+  "plusCode": {
+    "globalCode": "9F4CWR8X+VP",
+    "compoundCode": "8X+VP Berlin"
+  },
+  "types": ["school", "point_of_interest", "establishment"],
+  "googleMapsUri": "https://maps.google.com/?cid=843394675849373",
+  "websiteUri": "https://www.berlin-cosmopolitan.de/"
+}

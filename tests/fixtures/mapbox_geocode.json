@@ -1,0 +1,46 @@
+{
+  "type": "FeatureCollection",
+  "query": ["inselstraße", "10", "berlin"],
+  "features": [
+    {
+      "id": "address.9435218729",
+      "type": "Feature",
+      "place_type": ["address"],
+      "relevance": 0.98,
+      "properties": { "accuracy": "point" },
+      "text": "Inselstraße",
+      "place_name": "Inselstraße 10, 10179 Berlin, Germany",
+      "center": [13.41057, 52.51057],
+      "geometry": {
+        "type": "Point",
+        "coordinates": [13.41057, 52.51057]
+      },
+      "address": "10",
+      "context": [
+        { "id": "neighborhood.8", "text": "Mitte" },
+        { "id": "locality.2", "text": "Berlin" },
+        { "id": "country.1", "text": "Germany", "short_code": "de" }
+      ]
+    },
+    {
+      "id": "address.7740771055",
+      "type": "Feature",
+      "place_type": ["address"],
+      "relevance": 0.61,
+      "properties": { "accuracy": "point" },
+      "text": "Inselstraße",
+      "place_name": "Inselstraße 10, 26789 Leer, Germany",
+      "center": [7.45128, 53.23112],
+      "geometry": {
+        "type": "Point",
+        "coordinates": [7.45128, 53.23112]
+      },
+      "address": "10",
+      "context": [
+        { "id": "locality.4", "text": "Leer" },
+        { "id": "country.1", "text": "Germany", "short_code": "de" }
+      ]
+    }
+  ],
+  "attribution": "NOTICE: © 2026 Mapbox and its suppliers. All rights reserved. Use of this data is subject to the Mapbox Terms of Service (https://www.mapbox.com/about/maps/). This response and related information are not intended for navigation purposes."
+}

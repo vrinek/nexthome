@@ -1,0 +1,52 @@
+{
+  "html_attributions": [],
+  "next_page_token": "CrYCKhIA5pJjTkw2gvkUQa4oLbeG0bVNQtFzTQh5bZeGk2fXrBpGk2fXrBpGk2fXrBpGk2fXrBpGk2fXrBpGk2fXrBpGk2fXrBpGk2fXrBpGk2fXrBpGk2fXrBq4oL",
+  "results": [
+    {
+      "business_status": "OPERATIONAL",
+      "geometry": {
+        "location": { "lat": 52.5122, "lng": 13.4512 },
+        "viewport": {
+          "northeast": { "lat": 52.51355, "lng": 13.45265 },
+          "southwest": { "lat": 52.51085, "lng": 13.44975 }
+        }
+      },
+      "icon": "https://maps.gstatic.com/mapfiles/place_api/icons/v1/png/school-71.png",
+      "icon_background_color": "#7B1FA2",
+      "icon_mask_base_uri": "https://maps.gstatic.com/mapfiles/place_api/icons/v1/png/school-71",
+      "name": "Grundschule am Neumark",
+      "place_id": "ChIJgTwKg7COqEcRZ0m2XW",
+      "plus_code": {
+        "global_code": "9F4CVX82+2R",
+        "compound_code": "82+2R Berlin"
+      },
+      "rating": 4.3,
+      "reference": "ChIJgTwKg7COqEcRZ0m2XW",
+      "scope": "GOOGLE",
+      "types": ["primary_school", "school", "point_of_interest", "establishment"],
+      "user_ratings_total": 27,
+      "vicinity": "Neumark 12, Berlin"
+    },
+    {
+      "business_status": "OPERATIONAL",
+      "geometry": {
+        "location": { "lat": 52.5219, "lng": 13.4139 }
+      },
+      "icon": "https://maps.gstatic.com/mapfiles/place_api/icons/v1/png/school-71.png",
+      "icon_background_color": "#7B1FA2",
+      "name": "IB Primary School Berlin",
+      "place_id": "ChIJfXk8G1bOqEcRbtPf3S5",
+      "plus_code": {
+        "global_code": "9F4CWR9C+8P",
+        "compound_code": "9C+8P Berlin"
+      },
+      "rating": 4.1,
+      "reference": "ChIJfXk8G1bOqEcRbtPf3S5",
+      "scope": "GOOGLE",
+      "types": ["primary_school", "school", "point_of_interest", "establishment"],
+      "user_ratings_total": 19,
+      "vicinity": "Invalidenstraße 117, Berlin"
+    }
+  ],
+  "status": "OK"
+}
