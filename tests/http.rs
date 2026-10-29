@@ -8,7 +8,7 @@ use axum::{
 use common::FakeTransport;
 use nexthome::http::{self, HttpTransport, ReqwestTransport};
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn get_retrying_returns_the_response_after_transient_failures() {
     let transport = FakeTransport::new();
     transport.push_failed_get("dns lookup failed");
@@ -32,7 +32,7 @@ async fn get_retrying_returns_the_response_after_transient_failures() {
     assert_eq!(gets[0].params(), vec![("q", "berlin")]);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn get_retrying_gives_up_after_three_transport_failures() {
     let transport = FakeTransport::new();
     for _ in 0..3 {

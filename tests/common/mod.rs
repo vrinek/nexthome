@@ -47,6 +47,14 @@ pub async fn relocated_pool() -> (tempfile::TempDir, SqlitePool, i64) {
     (directory, pool, relocation_id)
 }
 
+/// A recorded provider response body from `tests/fixtures`, as read from
+/// disk.
+pub fn fixture(name: &str) -> String {
+    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read fixture {path}: {error}"))
+}
+
 /// One recorded GET: the url and the query params as the client passed them,
 /// before any percent-encoding.
 #[derive(Clone, Debug)]
