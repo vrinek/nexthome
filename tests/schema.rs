@@ -44,8 +44,10 @@ async fn migrations_apply_and_enforce_constraints() {
     .await
     .unwrap();
 
-    let orphan = sqlx::query("INSERT INTO issues (member_id, body) VALUES (999, 'orphan')")
-        .execute(&pool)
+    let orphan = sqlx::query(
+        "INSERT INTO issues (member_id, body, created_at) VALUES (999, 'orphan', '2026-10-24T12:30:00Z')",
+    )
+    .execute(&pool)
         .await
         .unwrap_err();
     assert!(
@@ -54,8 +56,8 @@ async fn migrations_apply_and_enforce_constraints() {
     );
 
     let duplicate = sqlx::query(
-        "INSERT INTO locations (id, relocation_id, place_type_id, member_id, name, lat, lon, state, source_url)
-         VALUES (2, 1, 1, 1, 'same place twice', 52.52, 13.41, 'inbox', 'https://example.com/places/1')",
+        "INSERT INTO locations (id, relocation_id, place_type_id, member_id, name, lat, lon, state, source_url, created_at, updated_at)
+         VALUES (2, 1, 1, 1, 'same place twice', 52.52, 13.41, 'inbox', 'https://example.com/places/1', '2026-10-24T12:30:00Z', '2026-10-24T12:30:00Z')",
     )
     .execute(&pool)
     .await
@@ -65,6 +67,20 @@ async fn migrations_apply_and_enforce_constraints() {
             .to_string()
             .contains("UNIQUE constraint failed: locations.relocation_id, locations.source_url"),
         "the same source_url twice in one relocation, expected a unique violation: {duplicate}"
+    );
+
+    let null_state = sqlx::query(
+        "INSERT INTO locations (id, relocation_id, member_id, name, lat, lon, state, created_at, updated_at)
+         VALUES (3, 1, 1, 'no state', 52.53, 13.42, NULL, '2026-10-24T12:30:00Z', '2026-10-24T12:30:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(
+        null_state
+            .to_string()
+            .contains("NOT NULL constraint failed: locations.state"),
+        "a location with a NULL state, expected a not-null violation: {null_state}"
     );
 
     pool.close().await;
