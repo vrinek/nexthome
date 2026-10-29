@@ -190,3 +190,43 @@ async fn add_place_type_refuses_an_archived_relocation_and_accepts_an_unarchived
 
     pool.close().await;
 }
+
+#[tokio::test]
+async fn activating_sets_expires_at_exactly_six_calendar_months_after_paid_at() {
+    let (_directory, pool) = migrated_pool().await;
+
+    let created = accounts::create_with_first_member(&pool, "mover@example.com")
+        .await
+        .unwrap();
+    let relocation_id =
+        relocations::create(&pool, created.account_id, "Berlin", 52.52, 13.405, 11.5)
+            .await
+            .unwrap();
+
+    let activated = relocations::activate(&pool, relocation_id).await.unwrap();
+
+    // paid_at comes from SQLite's strftime; the shape check catches a
+    // format-string typo.
+    assert_eq!(activated.paid_at.len(), 20);
+    assert!(activated.paid_at.ends_with('Z'));
+
+    // expires_at must be exactly paid_at advanced by six calendar months
+    // (SQLite's '+6 months' modifier), and the returned values must be the
+    // stored ones.
+    let (paid_at, expires_at, six_months_on): (String, String, String) = sqlx::query_as(
+        "SELECT paid_at, expires_at, strftime('%Y-%m-%dT%H:%M:%SZ', paid_at, '+6 months')
+         FROM relocations WHERE id = ?",
+    )
+    .bind(relocation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(activated.paid_at, paid_at);
+    assert_eq!(activated.expires_at, expires_at);
+    assert_eq!(
+        expires_at, six_months_on,
+        "expires_at must be exactly six calendar months after paid_at"
+    );
+
+    pool.close().await;
+}

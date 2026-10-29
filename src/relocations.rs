@@ -57,6 +57,14 @@ pub const SEED_PLACE_TYPES: [PlaceType<'static>; 5] = [
     },
 ];
 
+/// A relocation after activation: the instant payment was recorded and
+/// the instant, six calendar months later, when its data turns read-only.
+#[derive(Debug)]
+pub struct Activated {
+    pub paid_at: String,
+    pub expires_at: String,
+}
+
 /// Why a relocation write was refused, or the database error behind a
 /// failed one. The refusal messages are fit to show to a user.
 #[derive(Debug)]
@@ -156,6 +164,30 @@ pub async fn create(
     }
     transaction.commit().await?;
     Ok(relocation_id)
+}
+
+/// Marks the relocation paid: `paid_at` becomes now and `expires_at` the
+/// same instant advanced by six calendar months. Both timestamps are
+/// written by one UPDATE, so they derive from the same second. Refuses
+/// archived or unknown relocations through the write guard.
+pub async fn activate(pool: &SqlitePool, relocation_id: i64) -> Result<Activated, RelocationError> {
+    let mut transaction = pool.begin().await?;
+    ensure_writable(&mut *transaction, relocation_id).await?;
+    let (paid_at, expires_at): (String, String) = sqlx::query_as(
+        "UPDATE relocations
+         SET paid_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+             expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+6 months')
+         WHERE id = ?
+         RETURNING paid_at, expires_at",
+    )
+    .bind(relocation_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Activated {
+        paid_at,
+        expires_at,
+    })
 }
 
 async fn insert_place_type<'e, E>(
