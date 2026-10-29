@@ -120,6 +120,37 @@ async fn revoking_a_key_clears_its_hash() {
 }
 
 #[tokio::test]
+async fn two_members_cannot_share_one_key_hash() {
+    let (_directory, pool) = migrated_pool().await;
+
+    let first = accounts::create_with_first_member(&pool, "mover@example.com")
+        .await
+        .unwrap();
+    let second = accounts::add_member(&pool, first.account_id, "partner@example.com")
+        .await
+        .unwrap();
+
+    let error = sqlx::query("UPDATE members SET api_key_hash = ? WHERE id = ?")
+        .bind(api_keys::hash(&first.api_key))
+        .bind(second.member_id)
+        .execute(&pool)
+        .await
+        .expect_err("two members sharing one key hash must be rejected");
+    assert!(
+        error
+            .as_database_error()
+            .is_some_and(|database_error| database_error.is_unique_violation()),
+        "a key hash must identify at most one member: {error}"
+    );
+
+    // Revoked members all share NULL, which the unique index must allow.
+    assert!(api_keys::revoke(&pool, first.member_id).await.unwrap());
+    assert!(api_keys::revoke(&pool, second.member_id).await.unwrap());
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn duplicate_emails_are_rejected() {
     let (_directory, pool) = migrated_pool().await;
 

@@ -19,3 +19,7 @@ INSERT INTO members_new (id, account_id, email, api_key_hash, created_at)
 DROP TABLE members;
 ALTER TABLE members_new RENAME TO members;
 CREATE INDEX idx_members_account_id ON members (account_id);
+-- One key hash identifies at most one member, so a presented key resolves to
+-- exactly one account. Revoked members all share NULL, which this index
+-- allows.
+CREATE UNIQUE INDEX idx_members_api_key_hash ON members (api_key_hash);
