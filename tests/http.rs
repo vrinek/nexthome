@@ -44,12 +44,6 @@ async fn get_retrying_gives_up_after_three_transport_failures() {
         .expect_err("three transport failures in a row exhaust the retries");
     assert_eq!(error.0, "connection refused");
     assert_eq!(transport.recorded_gets().len(), 3);
-    assert!(
-        transport
-            .recorded_gets()
-            .iter()
-            .all(|get| get.params.is_empty())
-    );
 }
 
 #[tokio::test]

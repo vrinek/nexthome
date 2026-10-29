@@ -53,6 +53,14 @@ pub enum GoogleMapsError {
     NoGeocodeResults(String),
     /// A next page token stayed INVALID_REQUEST across its retries.
     InvalidPageToken(String),
+    /// The endpoint answered a body status that means the call did not run:
+    /// a rejected key, an exhausted quota, a malformed request. `message`
+    /// is Google's `error_message`, when it sent one.
+    ApiStatus {
+        endpoint: &'static str,
+        status: String,
+        message: Option<String>,
+    },
     /// The Distance Matrix endpoint answered a status other than OK.
     MatrixStatus(String),
     /// The Distance Matrix answer does not line up with the requested
@@ -104,6 +112,16 @@ impl fmt::Display for GoogleMapsError {
                     "Google kept answering INVALID_REQUEST for page token {token}"
                 )
             }
+            Self::ApiStatus {
+                endpoint,
+                status,
+                message,
+            } => match message {
+                Some(message) => {
+                    write!(formatter, "Google {endpoint} answered {status}: {message}")
+                }
+                None => write!(formatter, "Google {endpoint} answered {status}"),
+            },
             Self::MatrixStatus(status) => {
                 write!(formatter, "Google route matrix answered {status}")
             }
@@ -207,6 +225,11 @@ impl GoogleMapsClient<'_> {
                 continue;
             }
 
+            // A status other than OK and ZERO_RESULTS means the search did
+            // not run at all — a rejected key, an exhausted quota — and
+            // must not pass as an empty result list.
+            ensure_workable_status("nearby search", &body, &["OK", "ZERO_RESULTS"])?;
+
             if let Some(page_results) = body["results"].as_array() {
                 results.extend(page_results.iter().cloned());
             }
@@ -279,6 +302,9 @@ impl GoogleMapsClient<'_> {
         }
         let body: Value =
             serde_json::from_str(&response.body).map_err(GoogleMapsError::Unparseable)?;
+        // ZERO_RESULTS is the legitimate "nothing at that address"; any
+        // other failing status means the call did not run.
+        ensure_workable_status("geocode", &body, &["OK", "ZERO_RESULTS"])?;
         let location = body["results"]
             .as_array()
             .and_then(|results| results.first())
@@ -380,6 +406,9 @@ impl GoogleMapsClient<'_> {
         let response = self.get(FIND_PLACE_URL, &params).await?;
         let body: Value =
             serde_json::from_str(&response.body).map_err(GoogleMapsError::Unparseable)?;
+        // A single-place lookup has no legitimate empty answer: not even
+        // ZERO_RESULTS can pass as "no candidate".
+        ensure_workable_status("findplacefromtext", &body, &["OK"])?;
         let candidates: &[Value] = body["candidates"].as_array().map_or(&[][..], Vec::as_slice);
         if candidates.len() != 1 {
             return Err(GoogleMapsError::AmbiguousPlace {
@@ -407,6 +436,27 @@ impl GoogleMapsClient<'_> {
             .await
             .map_err(GoogleMapsError::Transport)
     }
+}
+
+/// Errors with the endpoint's body status when that status means the call
+/// did not run — a rejected key, an exhausted quota, a malformed request —
+/// carrying Google's `error_message` when there was one. `workable` lists
+/// the statuses the caller can answer for itself; a body without a status
+/// is treated as a status the caller cannot work with.
+fn ensure_workable_status(
+    endpoint: &'static str,
+    body: &Value,
+    workable: &[&str],
+) -> Result<(), GoogleMapsError> {
+    let status = body["status"].as_str().unwrap_or("unknown");
+    if workable.contains(&status) {
+        return Ok(());
+    }
+    Err(GoogleMapsError::ApiStatus {
+        endpoint,
+        status: status.to_owned(),
+        message: body["error_message"].as_str().map(str::to_owned),
+    })
 }
 
 /// The positions as a Distance Matrix parameter: "lat,lng" pairs joined

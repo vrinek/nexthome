@@ -48,7 +48,10 @@ pub const RETRY_ATTEMPTS: u32 = 3;
 pub const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 /// GETs through the transport with retries, as the Rails `HttpRetry.get`
-/// did.
+/// did: every failure stays visible in the log — transport errors and
+/// non-2xx statuses alike, on every attempt including the last — and a bad
+/// status is returned rather than retried, because the caller decides what
+/// a bad status means.
 pub async fn get_retrying(
     transport: &dyn HttpTransport,
     url: &str,
@@ -56,9 +59,8 @@ pub async fn get_retrying(
 ) -> Result<HttpResponse, TransportError> {
     let mut attempt = 1;
     loop {
-        match transport.get(url, params).await {
-            Ok(response) => return Ok(response),
-            Err(error) if attempt >= RETRY_ATTEMPTS => return Err(error),
+        let response = match transport.get(url, params).await {
+            Ok(response) => response,
             Err(error) => {
                 tracing::warn!(
                     "GET {}?{} attempt {}/{} failed with {error}",
@@ -67,10 +69,25 @@ pub async fn get_retrying(
                     attempt,
                     RETRY_ATTEMPTS
                 );
+                if attempt >= RETRY_ATTEMPTS {
+                    return Err(error);
+                }
                 tokio::time::sleep(RETRY_BACKOFF * attempt).await;
                 attempt += 1;
+                continue;
             }
+        };
+        if !(200..299).contains(&response.status) {
+            tracing::warn!(
+                "GET {}?{} attempt {}/{} returned {}",
+                url,
+                redact(params),
+                attempt,
+                RETRY_ATTEMPTS,
+                response.status
+            );
         }
+        return Ok(response);
     }
 }
 

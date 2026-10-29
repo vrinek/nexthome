@@ -174,6 +174,36 @@ async fn find_by_type_follows_the_pagination_token_and_retries_a_not_yet_valid_o
 }
 
 #[tokio::test]
+async fn find_by_type_errors_when_google_denies_the_search() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    transport.push_ok_get(200, &fixture("google_nearby_denied.json"));
+
+    let error = client(&transport, &pool, relocation_id)
+        .find_by_type(
+            Some("school"),
+            Coordinates {
+                lat: 52.5,
+                lng: 13.4,
+            },
+            None,
+        )
+        .await
+        .expect_err("a denied search must not look like an empty one");
+
+    assert!(
+        matches!(error, GoogleMapsError::ApiStatus { .. }),
+        "expected an api-status error, got: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "Google nearby search answered REQUEST_DENIED: The provided API key is invalid."
+    );
+    // The request was made and counted, even though Google refused it.
+    assert_eq!(google_calls(&pool, relocation_id).await, 1);
+}
+
+#[tokio::test]
 async fn find_by_type_gives_up_when_the_page_token_never_becomes_valid() {
     let (_directory, pool, relocation_id) = relocated_pool().await;
     let transport = FakeTransport::new();
@@ -270,6 +300,57 @@ async fn place_id_from_shared_link_searches_without_a_bias_when_the_url_has_no_c
             ("key", "test-key"),
         ],
         "no map centre in the url, so no locationbias"
+    );
+}
+
+#[tokio::test]
+async fn place_id_from_shared_link_errors_when_google_denies_the_search() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    transport.push_redirect_head(
+        "https://www.google.com/maps/place/Berlin+Cosmopolitan+School/@52.5267634,13.407897,16.17z",
+    );
+    transport.push_ok_get(
+        200,
+        r#"{"candidates": [], "error_message": "You have exceeded your request quota for this API.", "status": "REQUEST_DENIED"}"#,
+    );
+
+    let error = client(&transport, &pool, relocation_id)
+        .place_id_from_shared_link(SHORT_LINK)
+        .await
+        .expect_err("a denied search must not look like an unmatched name");
+
+    assert!(
+        matches!(error, GoogleMapsError::ApiStatus { .. }),
+        "expected an api-status error, got: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "Google findplacefromtext answered REQUEST_DENIED: You have exceeded your request quota for this API."
+    );
+}
+
+#[tokio::test]
+async fn place_id_from_shared_link_errors_when_google_finds_no_place() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    transport.push_redirect_head(
+        "https://www.google.com/maps/place/Berlin+Cosmopolitan+School/@52.5267634,13.407897,16.17z",
+    );
+    transport.push_ok_get(200, r#"{"candidates": [], "status": "ZERO_RESULTS"}"#);
+
+    let error = client(&transport, &pool, relocation_id)
+        .place_id_from_shared_link(SHORT_LINK)
+        .await
+        .expect_err("a single-place lookup has no legitimate empty answer");
+
+    assert!(
+        matches!(error, GoogleMapsError::ApiStatus { .. }),
+        "expected an api-status error, got: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "Google findplacefromtext answered ZERO_RESULTS"
     );
 }
 
@@ -461,6 +542,30 @@ async fn coordinates_from_address_fails_on_a_non_200_answer() {
     assert!(
         matches!(error, GoogleMapsError::GeocodeFailed(500)),
         "expected a geocode-failed error with the status, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn coordinates_from_address_errors_when_google_denies_the_geocode() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    transport.push_ok_get(
+        200,
+        r#"{"results": [], "error_message": "You have exceeded your request quota for this API.", "status": "REQUEST_DENIED"}"#,
+    );
+
+    let error = client(&transport, &pool, relocation_id)
+        .coordinates_from_address("Inselstraße 10, Berlin")
+        .await
+        .expect_err("a denied geocode must not look like an unfound address");
+
+    assert!(
+        matches!(error, GoogleMapsError::ApiStatus { .. }),
+        "expected an api-status error, got: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "Google geocode answered REQUEST_DENIED: You have exceeded your request quota for this API."
     );
 }
 
