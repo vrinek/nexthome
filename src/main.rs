@@ -1,6 +1,7 @@
 use std::{env, error::Error, str::FromStr, time::Duration};
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
+use nexthome::auth::AuthenticatedMember;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -23,11 +24,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/me", get(me))
         .with_state(pool);
     let listener = TcpListener::bind(bind).await?;
     tracing::info!("listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// Answers with the identity the bearer key resolved to, so the key
+// extractor can be exercised end to end over HTTP.
+async fn me(member: AuthenticatedMember) -> String {
+    format!(
+        "{} {} {}",
+        member.account_id, member.member_id, member.email
+    )
 }
 
 async fn healthz(State(pool): State<SqlitePool>) -> Result<&'static str, StatusCode> {
