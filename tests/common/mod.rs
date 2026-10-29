@@ -1,10 +1,51 @@
 //! Shared helpers for the integration tests: the fake transport that stands
-//! in for the real HTTP layer, so no test ever calls a live provider.
+//! in for the real HTTP layer, so no test ever calls a live provider, and the
+//! temporary databases the client tests count their usage against.
 
-use std::{collections::VecDeque, sync::Mutex};
+// Each test binary compiles this module on its own, so a helper one target
+// never touches looks dead to it.
+#![allow(dead_code)]
+
+use std::{collections::VecDeque, str::FromStr, sync::Mutex};
 
 use async_trait::async_trait;
-use nexthome::http::{HttpResponse, HttpTransport, TransportError};
+use nexthome::{
+    accounts,
+    http::{HttpResponse, HttpTransport, TransportError},
+    relocations,
+};
+use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
+
+/// A migrated pool over its own temporary database. SQLite enforces foreign
+/// keys only when the connection opts in, and main.rs runs with them on, so
+/// these tests do too.
+pub async fn migrated_pool() -> (tempfile::TempDir, SqlitePool) {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("nexthome.db").display()
+    );
+    let options = SqliteConnectOptions::from_str(&url)
+        .unwrap()
+        .foreign_keys(true);
+    let pool = SqlitePool::connect_with(options).await.unwrap();
+    sqlx::migrate!().run(&pool).await.unwrap();
+    (directory, pool)
+}
+
+/// A migrated pool with an account and one relocation in Berlin, whose id
+/// the map clients count their calls against.
+pub async fn relocated_pool() -> (tempfile::TempDir, SqlitePool, i64) {
+    let (directory, pool) = migrated_pool().await;
+    let created = accounts::create_with_first_member(&pool, "mover@example.com")
+        .await
+        .unwrap();
+    let relocation_id =
+        relocations::create(&pool, created.account_id, "Berlin", 52.52, 13.405, 11.5)
+            .await
+            .unwrap();
+    (directory, pool, relocation_id)
+}
 
 /// One recorded GET: the url and the query params as the client passed them,
 /// before any percent-encoding.
