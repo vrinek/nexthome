@@ -1,7 +1,7 @@
 use std::{fmt, time::Duration};
 
 use async_trait::async_trait;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 
 /// A response as the map clients see it: the status code, the body text and,
 /// when the server sent one, the `Location` header a redirect points at.
@@ -178,6 +178,13 @@ const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
 /// `URI.encode_uri_component` did.
 pub(crate) fn encode_component(component: &str) -> String {
     utf8_percent_encode(component, URI_COMPONENT).to_string()
+}
+
+/// Percent-decodes, as Ruby's `URI.decode_uri_component` did.
+pub(crate) fn decode_component(component: &str) -> String {
+    percent_decode_str(component)
+        .decode_utf8_lossy()
+        .to_string()
 }
 
 /// The params as a percent-encoded query string, without the leading `?`.

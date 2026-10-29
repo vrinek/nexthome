@@ -113,6 +113,35 @@ impl FakeTransport {
     pub fn recorded_gets(&self) -> Vec<RecordedGet> {
         self.gets.lock().unwrap().clone()
     }
+
+    /// Scripts the next HEAD's outcome.
+    pub fn push_head(&self, response: Result<HttpResponse, TransportError>) {
+        self.head_responses.lock().unwrap().push_back(response);
+    }
+
+    /// Scripts a HEAD that answers 302 to the given url, as a Maps short
+    /// link does.
+    pub fn push_redirect_head(&self, location: &str) {
+        self.push_head(Ok(HttpResponse {
+            status: 302,
+            body: String::new(),
+            location: Some(location.to_owned()),
+        }));
+    }
+
+    /// Scripts a HEAD that answers the status without a redirect.
+    pub fn push_ok_head(&self, status: u16) {
+        self.push_head(Ok(HttpResponse {
+            status,
+            body: String::new(),
+            location: None,
+        }));
+    }
+
+    /// Every HEAD the transport saw, in order.
+    pub fn recorded_heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]

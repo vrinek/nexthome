@@ -1,0 +1,26 @@
+{
+  "html_attributions": [],
+  "results": [
+    {
+      "business_status": "OPERATIONAL",
+      "geometry": {
+        "location": { "lat": 52.5311, "lng": 13.3866 }
+      },
+      "icon": "https://maps.gstatic.com/mapfiles/place_api/icons/v1/png/school-71.png",
+      "icon_background_color": "#7B1FA2",
+      "name": "Anna-Seghers-Grundschule",
+      "place_id": "ChIJhXz8M9WqEcRz8Qm2bT7",
+      "plus_code": {
+        "global_code": "9F4CWVC9+45",
+        "compound_code": "9+45 Berlin"
+      },
+      "rating": 4.0,
+      "reference": "ChIJhXz8M9WqEcRz8Qm2bT7",
+      "scope": "GOOGLE",
+      "types": ["primary_school", "school", "point_of_interest", "establishment"],
+      "user_ratings_total": 33,
+      "vicinity": "Dorfstraße 3, Berlin"
+    }
+  ],
+  "status": "OK"
+}
