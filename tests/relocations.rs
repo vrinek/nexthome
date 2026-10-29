@@ -230,3 +230,84 @@ async fn activating_sets_expires_at_exactly_six_calendar_months_after_paid_at() 
 
     pool.close().await;
 }
+
+#[tokio::test]
+async fn archive_expired_archives_only_relocations_past_expiry() {
+    let (_directory, pool) = migrated_pool().await;
+
+    let created = accounts::create_with_first_member(&pool, "mover@example.com")
+        .await
+        .unwrap();
+    let expired_id = relocations::create(&pool, created.account_id, "Berlin", 52.52, 13.405, 11.5)
+        .await
+        .unwrap();
+    let expiring_id =
+        relocations::create(&pool, created.account_id, "Vienna", 48.208, 16.373, 11.0)
+            .await
+            .unwrap();
+    let unpaid_id = relocations::create(&pool, created.account_id, "Tokyo", 35.689, 139.692, 11.0)
+        .await
+        .unwrap();
+    // paid 7 months ago, expired 1 month ago
+    sqlx::query(
+        "UPDATE relocations
+         SET paid_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 months'),
+             expires_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 month')
+         WHERE id = ?",
+    )
+    .bind(expired_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // paid six months before it expires: still live, but only for another
+    // minute
+    sqlx::query(
+        "UPDATE relocations
+         SET paid_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-6 months','+1 minute'),
+             expires_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 minute')
+         WHERE id = ?",
+    )
+    .bind(expiring_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // unpaid_id keeps its NULL paid_at and expires_at, as created
+
+    assert_eq!(relocations::archive_expired(&pool).await.unwrap(), 1);
+    // a second run must not re-archive or touch anything else
+    assert_eq!(relocations::archive_expired(&pool).await.unwrap(), 0);
+
+    let expired_archived_at: Option<String> =
+        sqlx::query_scalar("SELECT archived_at FROM relocations WHERE id = ?")
+            .bind(expired_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let archived_at = expired_archived_at.expect("the expired relocation is archived");
+    assert_eq!(archived_at.len(), 20);
+    assert!(archived_at.ends_with('Z'));
+
+    let expiring_archived_at: Option<String> =
+        sqlx::query_scalar("SELECT archived_at FROM relocations WHERE id = ?")
+            .bind(expiring_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        expiring_archived_at.is_none(),
+        "a relocation just before expiry must stay untouched"
+    );
+
+    let unpaid_archived_at: Option<String> =
+        sqlx::query_scalar("SELECT archived_at FROM relocations WHERE id = ?")
+            .bind(unpaid_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        unpaid_archived_at.is_none(),
+        "an unpaid relocation has no expires_at and is never archived"
+    );
+
+    pool.close().await;
+}

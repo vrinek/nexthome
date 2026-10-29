@@ -190,6 +190,23 @@ pub async fn activate(pool: &SqlitePool, relocation_id: i64) -> Result<Activated
     })
 }
 
+/// Archives every relocation whose `expires_at` has passed: sets
+/// `archived_at` to now on rows that have none yet, and returns how many
+/// it archived. Unpaid relocations have no `expires_at` and are never
+/// archived here. A plain function for the daily job to call; nothing
+/// schedules it yet.
+pub async fn archive_expired(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE relocations
+         SET archived_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE archived_at IS NULL
+           AND expires_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 async fn insert_place_type<'e, E>(
     executor: E,
     relocation_id: i64,
