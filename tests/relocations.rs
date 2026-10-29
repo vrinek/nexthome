@@ -232,6 +232,46 @@ async fn activating_sets_expires_at_exactly_six_calendar_months_after_paid_at() 
 }
 
 #[tokio::test]
+async fn activating_an_archived_relocation_is_refused_and_leaves_its_timestamps_alone() {
+    let (_directory, pool) = migrated_pool().await;
+
+    let created = accounts::create_with_first_member(&pool, "mover@example.com")
+        .await
+        .unwrap();
+    let relocation_id =
+        relocations::create(&pool, created.account_id, "Berlin", 52.52, 13.405, 11.5)
+            .await
+            .unwrap();
+    let activated = relocations::activate(&pool, relocation_id).await.unwrap();
+    sqlx::query(
+        "UPDATE relocations SET archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+    )
+    .bind(relocation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = relocations::activate(&pool, relocation_id)
+        .await
+        .expect_err("an archived relocation cannot be re-activated");
+    assert!(
+        matches!(error, RelocationError::Archived),
+        "expected an archive refusal, got: {error}"
+    );
+
+    let (paid_at, expires_at): (String, String) =
+        sqlx::query_as("SELECT paid_at, expires_at FROM relocations WHERE id = ?")
+            .bind(relocation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(paid_at, activated.paid_at);
+    assert_eq!(expires_at, activated.expires_at);
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn archive_expired_archives_only_relocations_past_expiry() {
     let (_directory, pool) = migrated_pool().await;
 
