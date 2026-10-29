@@ -6,6 +6,9 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 axum = "0.8"
+hex = "0.4.3"
+rand = "0.10.3"
+sha2 = "0.11.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tracing = "0.1"
