@@ -132,8 +132,8 @@ async fn duplicate_emails_are_rejected() {
         .expect("a second member with an existing email must be rejected");
     assert!(
         error
-            .to_string()
-            .contains("UNIQUE constraint failed: members.email"),
+            .as_database_error()
+            .is_some_and(|database_error| database_error.is_unique_violation()),
         "a second member with an existing email must violate the unique constraint: {error}"
     );
 
