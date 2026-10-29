@@ -12,6 +12,7 @@ use crate::{
 const NEARBY_SEARCH_URL: &str = "https://maps.googleapis.com/maps/api/place/nearbysearch/json";
 const FIND_PLACE_URL: &str = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json";
 const GEOCODE_URL: &str = "https://maps.googleapis.com/maps/api/geocode/json";
+const DISTANCE_MATRIX_URL: &str = "https://maps.googleapis.com/maps/api/distancematrix/json";
 /// The Places API v1 field mask the app stores with each place.
 const DETAILS_FIELDS: &str =
     "businessStatus,location,id,plusCode,types,googleMapsUri,websiteUri,displayName";
@@ -52,6 +53,11 @@ pub enum GoogleMapsError {
     NoGeocodeResults(String),
     /// A next page token stayed INVALID_REQUEST across its retries.
     InvalidPageToken(String),
+    /// The Distance Matrix endpoint answered a status other than OK.
+    MatrixStatus(String),
+    /// The Distance Matrix answer does not line up with the requested
+    /// origins and destinations, so its entries cannot be matched to pairs.
+    MatrixShape(String),
 }
 
 impl fmt::Display for GoogleMapsError {
@@ -98,6 +104,31 @@ impl fmt::Display for GoogleMapsError {
                     "Google kept answering INVALID_REQUEST for page token {token}"
                 )
             }
+            Self::MatrixStatus(status) => {
+                write!(formatter, "Google route matrix answered {status}")
+            }
+            Self::MatrixShape(mismatch) => write!(formatter, "{mismatch}"),
+        }
+    }
+}
+
+/// The travel modes the route matrix is asked for: the evaluation's bike,
+/// transit and car times. Walking is not among them — the evaluation
+/// derives walking minutes from stored isochrones, with no API call.
+#[derive(Clone, Copy, Debug)]
+pub enum TravelMode {
+    Bicycling,
+    Transit,
+    Driving,
+}
+
+impl TravelMode {
+    /// The Distance Matrix `mode` parameter value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bicycling => "bicycling",
+            Self::Transit => "transit",
+            Self::Driving => "driving",
         }
     }
 }
@@ -260,6 +291,59 @@ impl GoogleMapsClient<'_> {
         }
     }
 
+    /// One Distance Matrix request: the travel time in minutes from every
+    /// origin to every destination by the mode, one row per origin and one
+    /// entry per destination, in the order sent. An unreachable pair is
+    /// None.
+    pub async fn route_matrix(
+        &self,
+        origins: &[Coordinates],
+        destinations: &[Coordinates],
+        mode: TravelMode,
+    ) -> Result<Vec<Vec<Option<u32>>>, GoogleMapsError> {
+        let response = self
+            .get(
+                DISTANCE_MATRIX_URL,
+                &[
+                    ("origins", positions_param(origins)),
+                    ("destinations", positions_param(destinations)),
+                    ("mode", mode.as_str().to_owned()),
+                    ("key", self.api_key.to_owned()),
+                ],
+            )
+            .await?;
+        let body: Value =
+            serde_json::from_str(&response.body).map_err(GoogleMapsError::Unparseable)?;
+        if body["status"] != "OK" {
+            return Err(GoogleMapsError::MatrixStatus(
+                body["status"].as_str().unwrap_or("unknown").to_owned(),
+            ));
+        }
+
+        let rows: &[Value] = body["rows"].as_array().map_or(&[][..], Vec::as_slice);
+        if rows.len() != origins.len() {
+            return Err(GoogleMapsError::MatrixShape(format!(
+                "route matrix answer does not match: {} rows for {} origins",
+                rows.len(),
+                origins.len()
+            )));
+        }
+        let mut matrix = Vec::with_capacity(rows.len());
+        for row in rows {
+            let elements: &[Value] = row["elements"].as_array().map_or(&[][..], Vec::as_slice);
+            if elements.len() != destinations.len() {
+                return Err(GoogleMapsError::MatrixShape(format!(
+                    "route matrix answer does not match: {} elements for {} destinations",
+                    elements.len(),
+                    destinations.len()
+                )));
+            }
+            let durations = elements.iter().map(travel_minutes).collect();
+            matrix.push(durations);
+        }
+        Ok(matrix)
+    }
+
     /// Resolves a Maps short link to the url it points at. Short links
     /// answer HEAD with a 302; anything else means the link is not
     /// expandable.
@@ -323,6 +407,23 @@ impl GoogleMapsClient<'_> {
             .await
             .map_err(GoogleMapsError::Transport)
     }
+}
+
+/// The positions as a Distance Matrix parameter: "lat,lng" pairs joined
+/// with `|`.
+fn positions_param(positions: &[Coordinates]) -> String {
+    positions
+        .iter()
+        .map(|position| format!("{},{}", position.lat, position.lng))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// The element's travel duration in minutes, rounded to the nearest
+/// minute, or None when the pair has no duration at all.
+fn travel_minutes(element: &Value) -> Option<u32> {
+    let seconds = element["duration"]["value"].as_u64()?;
+    Some(((seconds + 30) / 60) as u32)
 }
 
 /// The place name and the "lat,lng" map centre the expanded url carries,

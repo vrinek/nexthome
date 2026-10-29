@@ -3,7 +3,7 @@ mod common;
 use common::{FakeTransport, fixture, relocated_pool};
 use nexthome::{
     geo::Coordinates,
-    google_maps::{GoogleMapsClient, GoogleMapsError},
+    google_maps::{GoogleMapsClient, GoogleMapsError, TravelMode},
 };
 use sqlx::SqlitePool;
 
@@ -482,5 +482,127 @@ async fn coordinates_from_address_fails_when_geocoding_answers_no_result() {
     assert!(
         error.to_string().contains("No Such Street 1, Berlin"),
         "the message must name the address: {error}"
+    );
+}
+
+#[tokio::test]
+async fn route_matrix_returns_travel_minutes_for_every_pair() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    transport.push_ok_get(200, &fixture("google_distance_matrix.json"));
+
+    let minutes = client(&transport, &pool, relocation_id)
+        .route_matrix(
+            &[Coordinates {
+                lat: 52.52,
+                lng: 13.405,
+            }],
+            &[
+                Coordinates {
+                    lat: 52.5122,
+                    lng: 13.4512,
+                },
+                Coordinates {
+                    lat: 52.5219,
+                    lng: 13.4139,
+                },
+            ],
+            TravelMode::Bicycling,
+        )
+        .await
+        .unwrap();
+
+    // One row per origin, one entry per destination, in the order sent;
+    // an unreachable pair is None.
+    assert_eq!(minutes, vec![vec![Some(22), None]]);
+
+    let gets = transport.recorded_gets();
+    assert_eq!(gets.len(), 1);
+    assert_eq!(
+        gets[0].url,
+        "https://maps.googleapis.com/maps/api/distancematrix/json"
+    );
+    assert_eq!(
+        gets[0].params(),
+        vec![
+            ("origins", "52.52,13.405"),
+            ("destinations", "52.5122,13.4512|52.5219,13.4139"),
+            ("mode", "bicycling"),
+            ("key", "test-key"),
+        ]
+    );
+    assert_eq!(google_calls(&pool, relocation_id).await, 1);
+}
+
+#[tokio::test]
+async fn route_matrix_fails_when_google_answers_a_non_ok_status() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    transport.push_ok_get(
+        200,
+        r#"{"destination_addresses": [], "origin_addresses": [], "rows": [], "status": "OVER_QUERY_LIMIT"}"#,
+    );
+
+    let error = client(&transport, &pool, relocation_id)
+        .route_matrix(
+            &[Coordinates {
+                lat: 52.52,
+                lng: 13.405,
+            }],
+            &[Coordinates {
+                lat: 52.5122,
+                lng: 13.4512,
+            }],
+            TravelMode::Transit,
+        )
+        .await
+        .expect_err("a non-OK status carries no usable durations");
+
+    assert!(
+        matches!(error, GoogleMapsError::MatrixStatus(ref status) if status == "OVER_QUERY_LIMIT"),
+        "expected a matrix-status error with the status, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn route_matrix_fails_when_the_answer_does_not_match_the_requested_shape() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    // Two rows for one origin: the entries could not be matched to pairs.
+    transport.push_ok_get(
+        200,
+        r#"{
+            "destination_addresses": ["Neumark 12, 10117 Berlin"],
+            "origin_addresses": ["Inselstraße 10, 10179 Berlin", "Turmstraße 1, 10559 Berlin"],
+            "rows": [
+                {"elements": [{"status": "OK", "duration": {"text": "10 mins", "value": 600}}]},
+                {"elements": [{"status": "OK", "duration": {"text": "25 mins", "value": 1500}}]}
+            ],
+            "status": "OK"
+        }"#,
+    );
+
+    let error = client(&transport, &pool, relocation_id)
+        .route_matrix(
+            &[Coordinates {
+                lat: 52.52,
+                lng: 13.405,
+            }],
+            &[Coordinates {
+                lat: 52.5122,
+                lng: 13.4512,
+            }],
+            TravelMode::Driving,
+        )
+        .await
+        .expect_err("an answer that does not line up with the request must be refused");
+
+    assert!(
+        matches!(error, GoogleMapsError::MatrixShape(_)),
+        "expected a matrix-shape error, got: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "route matrix answer does not match: 2 rows for 1 origins"
     );
 }

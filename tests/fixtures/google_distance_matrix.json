@@ -1,0 +1,19 @@
+{
+  "destination_addresses": ["Neumark 12, 10117 Berlin", "Invalidenstraße 117, 10115 Berlin"],
+  "origin_addresses": ["Inselstraße 10, 10179 Berlin"],
+  "rows": [
+    {
+      "elements": [
+        {
+          "status": "OK",
+          "duration": { "text": "22 mins", "value": 1320 },
+          "distance": { "text": "4.6 km", "value": 4600 }
+        },
+        {
+          "status": "ZERO_RESULTS"
+        }
+      ]
+    }
+  ],
+  "status": "OK"
+}
