@@ -54,7 +54,7 @@ async fn healthz_runs_migrations_and_checks_sqlite() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(migrations, 1);
+    assert_eq!(migrations, 2);
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
         .fetch_one(&pool)
         .await

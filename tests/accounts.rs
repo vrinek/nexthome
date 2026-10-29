@@ -95,6 +95,26 @@ async fn add_member_gives_an_account_a_second_member_with_their_own_key() {
 }
 
 #[tokio::test]
+async fn revoking_a_key_clears_its_hash() {
+    let (_directory, pool) = migrated_pool().await;
+
+    let created = accounts::create_with_first_member(&pool, "mover@example.com")
+        .await
+        .unwrap();
+    api_keys::revoke(&pool, created.member_id).await.unwrap();
+
+    let api_key_hash: Option<String> =
+        sqlx::query_scalar("SELECT api_key_hash FROM members WHERE id = ?")
+            .bind(created.member_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(api_key_hash, None);
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn duplicate_emails_are_rejected() {
     let (_directory, pool) = migrated_pool().await;
 
