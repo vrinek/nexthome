@@ -1,6 +1,9 @@
 use std::str::FromStr;
 
-use nexthome::{accounts, relocations};
+use nexthome::{
+    accounts,
+    relocations::{self, PlaceType, RelocationError},
+};
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 
 /// One place_types row as the tests read it back: name, icon, color,
@@ -104,6 +107,85 @@ async fn creating_a_relocation_seeds_its_place_types() {
                 None
             ),
         ]
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn add_place_type_refuses_an_archived_relocation_and_accepts_an_unarchived_one() {
+    let (_directory, pool) = migrated_pool().await;
+
+    let created = accounts::create_with_first_member(&pool, "mover@example.com")
+        .await
+        .unwrap();
+    let unarchived_id =
+        relocations::create(&pool, created.account_id, "Berlin", 52.52, 13.405, 11.5)
+            .await
+            .unwrap();
+    let archived_id =
+        relocations::create(&pool, created.account_id, "Vienna", 48.208, 16.373, 11.0)
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE relocations SET archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+    )
+    .bind(archived_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let pharmacy = PlaceType {
+        name: "Pharmacy",
+        icon: "local-pharmacy",
+        color: "4361ee",
+        search_type: Some("pharmacy"),
+        search_keyword: None,
+    };
+
+    let place_type_id = relocations::add_place_type(&pool, unarchived_id, pharmacy)
+        .await
+        .unwrap();
+    let stored: PlaceTypeRow = sqlx::query_as(
+        "SELECT name, icon, color, search_type, search_keyword FROM place_types WHERE id = ?",
+    )
+    .bind(place_type_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        (
+            "Pharmacy".into(),
+            "local-pharmacy".into(),
+            "4361ee".into(),
+            Some("pharmacy".into()),
+            None
+        )
+    );
+
+    let error = relocations::add_place_type(&pool, archived_id, pharmacy)
+        .await
+        .expect_err("an archived relocation is read-only");
+    assert!(
+        matches!(error, RelocationError::Archived),
+        "expected an archive refusal, got: {error}"
+    );
+    let refused: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM place_types WHERE relocation_id = ? AND name = 'Pharmacy'",
+    )
+    .bind(archived_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(refused, 0, "the refused write must store nothing");
+
+    let error = relocations::add_place_type(&pool, 999, pharmacy)
+        .await
+        .expect_err("no relocation has id 999");
+    assert!(
+        matches!(error, RelocationError::NotFound),
+        "expected a not-found refusal, got: {error}"
     );
 
     pool.close().await;
