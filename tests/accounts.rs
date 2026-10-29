@@ -101,7 +101,12 @@ async fn revoking_a_key_clears_its_hash() {
     let created = accounts::create_with_first_member(&pool, "mover@example.com")
         .await
         .unwrap();
-    api_keys::revoke(&pool, created.member_id).await.unwrap();
+
+    let revoked = api_keys::revoke(&pool, 999).await.unwrap();
+    assert!(!revoked, "no member has id 999");
+
+    let revoked = api_keys::revoke(&pool, created.member_id).await.unwrap();
+    assert!(revoked);
 
     let api_key_hash: Option<String> =
         sqlx::query_scalar("SELECT api_key_hash FROM members WHERE id = ?")

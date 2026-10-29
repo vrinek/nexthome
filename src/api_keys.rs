@@ -16,10 +16,11 @@ pub fn hash(api_key: &str) -> String {
 }
 
 /// Clears the member's stored key hash so their key no longer authenticates.
-pub async fn revoke(pool: &SqlitePool, member_id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE members SET api_key_hash = NULL WHERE id = ?")
+/// Returns false when no member has that id.
+pub async fn revoke(pool: &SqlitePool, member_id: i64) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE members SET api_key_hash = NULL WHERE id = ?")
         .bind(member_id)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
