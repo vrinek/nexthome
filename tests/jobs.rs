@@ -1,10 +1,23 @@
 mod common;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use common::{migrated_pool, relocated_pool};
+use common::{
+    FakeTransport, fixture, mapbox_access, migrated_pool, relocated_pool, untouched_mapbox_access,
+};
 use nexthome::jobs;
 use sqlx::SqlitePool;
+
+/// The five isochrone responses a location's job consumes, scripted onto
+/// the transport in order.
+fn script_isochrones(transport: &FakeTransport) {
+    for _ in [5, 10, 15, 20, 30] {
+        transport.push_ok_get(200, &fixture("mapbox_isochrone.json"));
+    }
+}
 
 /// The job's attempts, last_error and done_at, as the tests read them
 /// back.
@@ -110,7 +123,11 @@ async fn a_failing_job_records_its_error_and_waits_out_its_backoff() {
     let (_directory, pool, _relocation_id) = relocated_pool().await;
 
     let job_id = jobs::enqueue_isochrones(&pool, 999).await.unwrap();
-    assert!(jobs::process_next(&pool).await.unwrap(), "the job is due");
+    let mapbox = untouched_mapbox_access();
+    assert!(
+        jobs::process_next(&pool, &mapbox).await.unwrap(),
+        "the job is due"
+    );
 
     let (attempts, last_error, done_at) = job_row(&pool, job_id).await;
     assert_eq!(attempts, 1);
@@ -128,7 +145,7 @@ async fn a_failing_job_records_its_error_and_waits_out_its_backoff() {
         "run_after {run_after} must sit ~10 s past {now}"
     );
     assert!(
-        !jobs::process_next(&pool).await.unwrap(),
+        !jobs::process_next(&pool, &mapbox).await.unwrap(),
         "the backed-off job is not claimable yet"
     );
 }
@@ -141,13 +158,14 @@ async fn a_failing_job_is_retried_with_backoff_up_to_five_attempts() {
         .await
         .unwrap();
     let expected_error = format!("no place type 999 exists in relocation {relocation_id}");
+    let mapbox = untouched_mapbox_access();
 
     // The waits the failures below must pin: ten seconds after the first
     // attempt, doubling each time.
     let expected_backoff = [10, 20, 40, 80];
     for attempt in 1i64..=5 {
         assert!(
-            jobs::process_next(&pool).await.unwrap(),
+            jobs::process_next(&pool, &mapbox).await.unwrap(),
             "attempt {attempt} must find the job due"
         );
 
@@ -172,7 +190,7 @@ async fn a_failing_job_is_retried_with_backoff_up_to_five_attempts() {
     // job is never claimed again.
     backoff_elapsed(&pool, job_id).await;
     assert!(
-        !jobs::process_next(&pool).await.unwrap(),
+        !jobs::process_next(&pool, &mapbox).await.unwrap(),
         "an exhausted job stays unclaimed, its last error kept"
     );
 }
@@ -198,7 +216,13 @@ async fn a_job_that_succeeds_is_marked_done_and_not_claimed_again() {
     .unwrap();
 
     let job_id = jobs::enqueue_isochrones(&pool, location_id).await.unwrap();
-    assert!(jobs::process_next(&pool).await.unwrap(), "the job is due");
+    let transport = Arc::new(FakeTransport::new());
+    script_isochrones(&transport);
+    let mapbox = mapbox_access(transport);
+    assert!(
+        jobs::process_next(&pool, &mapbox).await.unwrap(),
+        "the job is due"
+    );
 
     let (attempts, last_error, done_at) = job_row(&pool, job_id).await;
     assert_eq!(attempts, 1);
@@ -208,7 +232,7 @@ async fn a_job_that_succeeds_is_marked_done_and_not_claimed_again() {
     assert!(done_at.ends_with('Z'));
 
     assert!(
-        !jobs::process_next(&pool).await.unwrap(),
+        !jobs::process_next(&pool, &mapbox).await.unwrap(),
         "a done job is not claimable again"
     );
 }
@@ -220,7 +244,12 @@ async fn a_job_that_succeeds_on_a_retry_clears_its_last_error() {
     // The job's location does not exist yet, so the first attempt fails.
     let location_id = 999;
     let job_id = jobs::enqueue_isochrones(&pool, location_id).await.unwrap();
-    assert!(jobs::process_next(&pool).await.unwrap(), "the job is due");
+    let transport = Arc::new(FakeTransport::new());
+    let mapbox = mapbox_access(transport.clone());
+    assert!(
+        jobs::process_next(&pool, &mapbox).await.unwrap(),
+        "the job is due"
+    );
     let (attempts, last_error, done_at) = job_row(&pool, job_id).await;
     assert_eq!(attempts, 1);
     assert_eq!(
@@ -250,7 +279,11 @@ async fn a_job_that_succeeds_on_a_retry_clears_its_last_error() {
 
     // The retry succeeds: the job is done, its earlier failure is
     // cleared, and it is never claimed again.
-    assert!(jobs::process_next(&pool).await.unwrap(), "the retry is due");
+    script_isochrones(&transport);
+    assert!(
+        jobs::process_next(&pool, &mapbox).await.unwrap(),
+        "the retry is due"
+    );
     let (attempts, last_error, done_at) = job_row(&pool, job_id).await;
     assert_eq!(attempts, 2, "the retry is the second attempt");
     let done_at = done_at.expect("the retry succeeded");
@@ -258,7 +291,7 @@ async fn a_job_that_succeeds_on_a_retry_clears_its_last_error() {
     assert!(done_at.ends_with('Z'));
     assert_eq!(last_error, None, "a completed row must not read as failed");
     assert!(
-        !jobs::process_next(&pool).await.unwrap(),
+        !jobs::process_next(&pool, &mapbox).await.unwrap(),
         "a done job is not claimable again"
     );
 }
@@ -279,7 +312,11 @@ async fn the_archive_expired_job_runs_the_archiver() {
     .unwrap();
 
     let job_id = jobs::enqueue_archive_expired(&pool).await.unwrap();
-    assert!(jobs::process_next(&pool).await.unwrap(), "the job is due");
+    let mapbox = untouched_mapbox_access();
+    assert!(
+        jobs::process_next(&pool, &mapbox).await.unwrap(),
+        "the job is due"
+    );
 
     let (_, _, done_at) = job_row(&pool, job_id).await;
     assert!(done_at.is_some(), "the archive job completed");
@@ -309,12 +346,67 @@ async fn the_populate_job_completes_for_a_place_type_in_the_relocation() {
     let job_id = jobs::enqueue_populate(&pool, relocation_id, place_type_id, 52.52, 13.405)
         .await
         .unwrap();
-    assert!(jobs::process_next(&pool).await.unwrap(), "the job is due");
+    let mapbox = untouched_mapbox_access();
+    assert!(
+        jobs::process_next(&pool, &mapbox).await.unwrap(),
+        "the job is due"
+    );
 
     let (attempts, last_error, done_at) = job_row(&pool, job_id).await;
     assert_eq!(attempts, 1);
     assert!(last_error.is_none());
     assert!(done_at.is_some(), "the populate job completed");
+}
+
+#[tokio::test]
+async fn the_isochrones_job_generates_the_location_s_walking_contours() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let location_id = common::insert_location(&pool, relocation_id, None, 52.52, 13.405).await;
+    let job_id = jobs::enqueue_isochrones(&pool, location_id).await.unwrap();
+    let transport = Arc::new(FakeTransport::new());
+    script_isochrones(&transport);
+    let mapbox = mapbox_access(transport.clone());
+
+    assert!(
+        jobs::process_next(&pool, &mapbox).await.unwrap(),
+        "the job is due"
+    );
+
+    let (attempts, last_error, done_at) = job_row(&pool, job_id).await;
+    assert_eq!(attempts, 1);
+    assert_eq!(last_error, None);
+    assert!(done_at.is_some(), "the job generated every contour");
+    let minutes: Vec<i64> =
+        sqlx::query_scalar("SELECT minutes FROM isochrones WHERE location_id = ? ORDER BY minutes")
+            .bind(location_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(minutes, vec![5, 10, 15, 20, 30]);
+    assert_eq!(transport.recorded_gets().len(), 5);
+}
+
+#[tokio::test]
+async fn a_mapbox_failure_fails_the_isochrones_job_with_its_error() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let location_id = common::insert_location(&pool, relocation_id, None, 52.52, 13.405).await;
+    let job_id = jobs::enqueue_isochrones(&pool, location_id).await.unwrap();
+    let transport = Arc::new(FakeTransport::new());
+    // The fetch keeps answering a non-200, through its three retries.
+    for _ in 0..3 {
+        transport.push_ok_get(503, "service unavailable");
+    }
+    let mapbox = mapbox_access(transport.clone());
+
+    assert!(
+        jobs::process_next(&pool, &mapbox).await.unwrap(),
+        "the job is due"
+    );
+
+    let (attempts, last_error, done_at) = job_row(&pool, job_id).await;
+    assert_eq!(attempts, 1);
+    assert_eq!(last_error.as_deref(), Some("request to Mapbox failed: 503"));
+    assert!(done_at.is_none(), "a failed job is not done");
 }
 
 #[tokio::test]
@@ -330,9 +422,10 @@ async fn an_unknown_kind_or_a_bad_payload_fails_the_job_with_the_reason() {
     .await
     .unwrap();
 
+    let mapbox = untouched_mapbox_access();
     for _ in 0..3 {
         assert!(
-            jobs::process_next(&pool).await.unwrap(),
+            jobs::process_next(&pool, &mapbox).await.unwrap(),
             "each bad job is due until it fails"
         );
     }
@@ -366,7 +459,7 @@ async fn the_loop_runs_due_jobs_to_completion() {
     jobs::enqueue_archive_expired(&pool).await.unwrap();
     jobs::enqueue_archive_expired(&pool).await.unwrap();
 
-    tokio::spawn(jobs::run(pool.clone()));
+    tokio::spawn(jobs::run(pool.clone(), untouched_mapbox_access()));
 
     // The loop polls every second, so both jobs should be done well
     // inside ten.

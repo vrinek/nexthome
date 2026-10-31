@@ -7,7 +7,11 @@ use std::{fmt, time::Duration};
 use serde_json::{Value, json};
 use sqlx::{Executor, Sqlite, SqlitePool};
 
-use crate::relocations;
+use crate::{
+    isochrones::{self, IsochroneError},
+    mapbox::{MapboxAccess, MapboxError},
+    relocations,
+};
 
 /// The `jobs.kind` the isochrones job carries: walking isochrones for one
 /// location.
@@ -51,6 +55,8 @@ enum JobError {
         relocation_id: i64,
         place_type_id: i64,
     },
+    /// A Mapbox request behind the job failed.
+    Mapbox(MapboxError),
     /// A database operation behind the job failed.
     Database(sqlx::Error),
 }
@@ -76,6 +82,7 @@ impl fmt::Display for JobError {
                 formatter,
                 "no place type {place_type_id} exists in relocation {relocation_id}"
             ),
+            Self::Mapbox(error) => write!(formatter, "{error}"),
             Self::Database(error) => write!(formatter, "database operation failed: {error}"),
         }
     }
@@ -84,6 +91,7 @@ impl fmt::Display for JobError {
 impl std::error::Error for JobError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Mapbox(error) => Some(error),
             Self::Database(error) => Some(error),
             _ => None,
         }
@@ -200,11 +208,11 @@ pub async fn claim(pool: &SqlitePool) -> Result<Option<Job>, sqlx::Error> {
 /// `last_error` and the next backoff on failure. A job that fails five
 /// times keeps its last error and is never claimed again. Returns
 /// whether a job ran.
-pub async fn process_next(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+pub async fn process_next(pool: &SqlitePool, mapbox: &MapboxAccess) -> Result<bool, sqlx::Error> {
     let Some(job) = claim(pool).await? else {
         return Ok(false);
     };
-    match execute(pool, &job).await {
+    match execute(pool, mapbox, &job).await {
         Ok(()) => {
             sqlx::query(
                 "UPDATE jobs
@@ -246,11 +254,11 @@ pub async fn process_next(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
 }
 
 /// Runs one claimed job by its kind.
-async fn execute(pool: &SqlitePool, job: &Job) -> Result<(), JobError> {
+async fn execute(pool: &SqlitePool, mapbox: &MapboxAccess, job: &Job) -> Result<(), JobError> {
     let payload: Value = serde_json::from_str(&job.payload)
         .map_err(|error| JobError::Payload(format!("payload is not valid JSON: {error}")))?;
     match job.kind.as_str() {
-        KIND_ISOCHRONES => isochrones(pool, &payload).await,
+        KIND_ISOCHRONES => isochrones(pool, mapbox, &payload).await,
         KIND_POPULATE => populate(pool, &payload).await,
         KIND_ARCHIVE_EXPIRED => {
             relocations::archive_expired(pool).await?;
@@ -260,20 +268,23 @@ async fn execute(pool: &SqlitePool, job: &Job) -> Result<(), JobError> {
     }
 }
 
-/// The isochrones job: walking isochrones for one location. The contour
-/// generation is PLAN.md task 9's; until it lands, the job only checks
-/// its referent — a location that no longer exists fails the job, and
-/// one that exists completes it.
-async fn isochrones(pool: &SqlitePool, payload: &Value) -> Result<(), JobError> {
+/// The isochrones job: the location's missing walking isochrones,
+/// fetched from Mapbox and stored. A location that no longer exists
+/// fails the job, and a Mapbox failure fails it with the client's own
+/// message for the retry backoff to carry.
+async fn isochrones(
+    pool: &SqlitePool,
+    mapbox: &MapboxAccess,
+    payload: &Value,
+) -> Result<(), JobError> {
     let location_id = integer_field(payload, "location_id")?;
-    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM locations WHERE id = ?")
-        .bind(location_id)
-        .fetch_optional(pool)
-        .await?;
-    if found.is_none() {
-        return Err(JobError::MissingLocation(location_id));
-    }
-    Ok(())
+    isochrones::generate_for_location(pool, mapbox, location_id)
+        .await
+        .map_err(|error| match error {
+            IsochroneError::MissingLocation(location_id) => JobError::MissingLocation(location_id),
+            IsochroneError::Mapbox(error) => JobError::Mapbox(error),
+            IsochroneError::Database(error) => JobError::Database(error),
+        })
 }
 
 /// The populate job: fills a place type with nearby places around a
@@ -321,9 +332,9 @@ fn number_field(payload: &Value, name: &str) -> Result<f64, JobError> {
 /// keeps one process the only writer, and this loop is the only claimer
 /// in it, so jobs never run concurrently. Runs forever; the server
 /// spawns it at startup.
-pub async fn run(pool: SqlitePool) {
+pub async fn run(pool: SqlitePool, mapbox: MapboxAccess) {
     loop {
-        match process_next(&pool).await {
+        match process_next(&pool, &mapbox).await {
             Ok(true) => {}
             Ok(false) => tokio::time::sleep(POLL_INTERVAL).await,
             Err(error) => {
