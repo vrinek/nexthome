@@ -5,7 +5,7 @@
 use std::{fmt, time::Duration};
 
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 
 use crate::relocations;
 
@@ -101,9 +101,12 @@ pub struct Job {
 }
 
 /// Enqueues the isochrones job for one location.
-pub async fn enqueue_isochrones(pool: &SqlitePool, location_id: i64) -> Result<i64, sqlx::Error> {
+pub async fn enqueue_isochrones<'e, E>(executor: E, location_id: i64) -> Result<i64, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     enqueue(
-        pool,
+        executor,
         KIND_ISOCHRONES,
         &json!({ "location_id": location_id }),
     )
@@ -111,15 +114,18 @@ pub async fn enqueue_isochrones(pool: &SqlitePool, location_id: i64) -> Result<i
 }
 
 /// Enqueues the populate job for one place type around a center.
-pub async fn enqueue_populate(
-    pool: &SqlitePool,
+pub async fn enqueue_populate<'e, E>(
+    executor: E,
     relocation_id: i64,
     place_type_id: i64,
     lat: f64,
     lon: f64,
-) -> Result<i64, sqlx::Error> {
+) -> Result<i64, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     enqueue(
-        pool,
+        executor,
         KIND_POPULATE,
         &json!({
             "relocation_id": relocation_id,
@@ -133,12 +139,18 @@ pub async fn enqueue_populate(
 
 /// Enqueues the archive_expired job, which archives every expired
 /// relocation.
-pub async fn enqueue_archive_expired(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
-    enqueue(pool, KIND_ARCHIVE_EXPIRED, &json!({})).await
+pub async fn enqueue_archive_expired<'e, E>(executor: E) -> Result<i64, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    enqueue(executor, KIND_ARCHIVE_EXPIRED, &json!({})).await
 }
 
 /// Inserts the job as due now and returns its id.
-async fn enqueue(pool: &SqlitePool, kind: &str, payload: &Value) -> Result<i64, sqlx::Error> {
+async fn enqueue<'e, E>(executor: E, kind: &str, payload: &Value) -> Result<i64, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let payload = serde_json::to_string(payload).expect("a JSON value serializes");
     sqlx::query_scalar(
         "INSERT INTO jobs (kind, payload, run_after)
@@ -147,7 +159,7 @@ async fn enqueue(pool: &SqlitePool, kind: &str, payload: &Value) -> Result<i64, 
     )
     .bind(kind)
     .bind(payload)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -265,14 +277,14 @@ async fn isochrones(pool: &SqlitePool, payload: &Value) -> Result<(), JobError> 
 }
 
 /// The populate job: fills a place type with nearby places around a
-/// center. Creating those locations is PLAN.md task 8's; until it lands,
-/// the job only checks its referent — the place type must exist in the
-/// relocation.
+/// center. Creating those locations needs a Google client in the job
+/// loop, which has none yet; until then, the job only checks its
+/// referent — the place type must exist in the relocation.
 async fn populate(pool: &SqlitePool, payload: &Value) -> Result<(), JobError> {
     let relocation_id = integer_field(payload, "relocation_id")?;
     let place_type_id = integer_field(payload, "place_type_id")?;
-    // The center fields are checked now and used once task 8's location
-    // writes land; both must be numbers.
+    // The center fields are checked now and used once the job creates
+    // locations; both must be numbers.
     let _lat = number_field(payload, "lat")?;
     let _lon = number_field(payload, "lon")?;
     let found: Option<i64> =
