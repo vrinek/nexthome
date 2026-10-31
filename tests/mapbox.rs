@@ -2,13 +2,14 @@ mod common;
 
 use common::{FakeTransport, fixture, relocated_pool};
 use nexthome::{
+    api_usage::{self, CapError, CapReached, Caps, Provider},
     geo::Coordinates,
     mapbox::{MapboxClient, MapboxError},
 };
 use sqlx::SqlitePool;
 
-/// A client on the fake transport with a test token, as production would
-/// build one on `ReqwestTransport` with the real token.
+/// A client on the fake transport with a test token and unlimited caps; a
+/// test that exercises the caps sets its own.
 fn client<'a>(
     transport: &'a FakeTransport,
     pool: &'a SqlitePool,
@@ -19,6 +20,7 @@ fn client<'a>(
         pool,
         relocation_id,
         access_token: "test-token",
+        caps: Caps::default(),
     }
 }
 
@@ -160,6 +162,81 @@ async fn address_to_coordinates_fails_when_the_transport_stays_broken() {
         1,
         "the attempt was made and passed the cap check, so it counts"
     );
+}
+
+#[tokio::test]
+async fn address_to_coordinates_refuses_once_the_relocation_cap_is_reached() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    for _ in 0..2 {
+        api_usage::record_request(&pool, relocation_id, Provider::Mapbox)
+            .await
+            .unwrap();
+    }
+    let mut capped = client(&transport, &pool, relocation_id);
+    capped.caps = Caps {
+        relocation_monthly: Some(2),
+        global_monthly: Some(10),
+    };
+
+    let error = capped
+        .address_to_coordinates(
+            "Inselstraße 10, Berlin",
+            Coordinates {
+                lat: 52.52,
+                lng: 13.405,
+            },
+        )
+        .await
+        .expect_err("the relocation's third Mapbox request must not run");
+
+    assert!(
+        matches!(
+            error,
+            MapboxError::Cap(CapError::Reached(CapReached::Relocation { .. }))
+        ),
+        "expected the cap refusal, got: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "monthly cap reached for this relocation: 2 Mapbox requests this month, the cap is 2"
+    );
+    // The refusal comes before the transport and before the counting.
+    assert!(transport.recorded_gets().is_empty());
+    assert_eq!(
+        mapbox_calls(&pool, relocation_id).await,
+        2,
+        "a refused request records no usage"
+    );
+}
+
+#[tokio::test]
+async fn address_to_coordinates_passes_when_usage_stays_under_the_caps() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    transport.push_ok_get(200, &fixture("mapbox_geocode.json"));
+    api_usage::record_request(&pool, relocation_id, Provider::Mapbox)
+        .await
+        .unwrap();
+    let mut capped = client(&transport, &pool, relocation_id);
+    capped.caps = Caps {
+        relocation_monthly: Some(3),
+        global_monthly: Some(3),
+    };
+
+    capped
+        .address_to_coordinates(
+            "Inselstraße 10, Berlin",
+            Coordinates {
+                lat: 52.52,
+                lng: 13.405,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(transport.recorded_gets().len(), 1);
+    assert_eq!(mapbox_calls(&pool, relocation_id).await, 2);
 }
 
 #[tokio::test]

@@ -2,8 +2,10 @@ mod common;
 
 use common::{FakeTransport, fixture, relocated_pool};
 use nexthome::{
+    api_usage::{self, CapError, CapReached, Caps, Provider},
     geo::Coordinates,
     google_maps::{GoogleMapsClient, GoogleMapsError, TravelMode},
+    relocations,
 };
 use sqlx::SqlitePool;
 
@@ -11,8 +13,8 @@ const SHORT_LINK: &str = "https://maps.app.goo.gl/Rk5HAHR3rdiQgvJeA";
 const FIND_PLACE_URL: &str = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json";
 const NEARBY_SEARCH_URL: &str = "https://maps.googleapis.com/maps/api/place/nearbysearch/json";
 
-/// A client on the fake transport with a test key, as production would build
-/// one on `ReqwestTransport` with the real key.
+/// A client on the fake transport with a test key and unlimited caps; a
+/// test that exercises the caps sets its own.
 fn client<'a>(
     transport: &'a FakeTransport,
     pool: &'a SqlitePool,
@@ -23,6 +25,7 @@ fn client<'a>(
         pool,
         relocation_id,
         api_key: "test-key",
+        caps: Caps::default(),
     }
 }
 
@@ -588,6 +591,54 @@ async fn coordinates_from_address_fails_when_geocoding_answers_no_result() {
         error.to_string().contains("No Such Street 1, Berlin"),
         "the message must name the address: {error}"
     );
+}
+
+#[tokio::test]
+async fn coordinates_from_address_refuses_once_the_global_cap_is_reached() {
+    let (_directory, pool, berlin_id) = relocated_pool().await;
+    let account_id: i64 = sqlx::query_scalar("SELECT account_id FROM relocations WHERE id = ?")
+        .bind(berlin_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let vienna_id = relocations::create(&pool, account_id, "Vienna", 48.208, 16.373, 11.0)
+        .await
+        .unwrap();
+    // Both relocations stay under their own caps; together they reach the
+    // global one.
+    for relocation_id in [berlin_id, vienna_id] {
+        for _ in 0..2 {
+            api_usage::record_request(&pool, relocation_id, Provider::Google)
+                .await
+                .unwrap();
+        }
+    }
+    let transport = FakeTransport::new();
+    let mut capped = client(&transport, &pool, berlin_id);
+    capped.caps = Caps {
+        relocation_monthly: Some(5),
+        global_monthly: Some(4),
+    };
+
+    let error = capped
+        .coordinates_from_address("Inselstraße 10, Berlin")
+        .await
+        .expect_err("the fifth Google request across all relocations must not run");
+
+    assert!(
+        matches!(
+            error,
+            GoogleMapsError::Cap(CapError::Reached(CapReached::Global { .. }))
+        ),
+        "expected the cap refusal, got: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "global monthly cap reached: 4 Google requests this month, the cap is 4"
+    );
+    // The refusal comes before the transport and before the counting.
+    assert!(transport.recorded_gets().is_empty());
+    assert_eq!(google_calls(&pool, berlin_id).await, 2);
 }
 
 #[tokio::test]

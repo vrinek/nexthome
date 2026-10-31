@@ -4,7 +4,7 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 
 use crate::{
-    api_usage::{self, Provider},
+    api_usage::{self, Caps, Provider},
     geo::Coordinates,
     http::{self, HttpResponse, HttpTransport},
 };
@@ -35,6 +35,9 @@ pub enum GoogleMapsError {
     Transport(http::TransportError),
     /// Counting the request in `api_usage` failed.
     Usage(sqlx::Error),
+    /// A configured monthly cap refused the request, or reading the usage
+    /// behind the check failed.
+    Cap(api_usage::CapError),
     /// The response body was not the JSON Google sends.
     Unparseable(serde_json::Error),
     /// The shared link did not answer HEAD with the expected 302.
@@ -75,6 +78,7 @@ impl fmt::Display for GoogleMapsError {
             Self::Usage(error) => {
                 write!(formatter, "counting the call in api_usage failed: {error}")
             }
+            Self::Cap(error) => write!(formatter, "{error}"),
             Self::Unparseable(error) => {
                 write!(formatter, "Google Maps answered unparseable JSON: {error}")
             }
@@ -156,6 +160,7 @@ impl std::error::Error for GoogleMapsError {
         match self {
             Self::Transport(error) => Some(error),
             Self::Usage(error) => Some(error),
+            Self::Cap(error) => Some(error),
             Self::Unparseable(error) => Some(error),
             _ => None,
         }
@@ -164,12 +169,13 @@ impl std::error::Error for GoogleMapsError {
 
 /// The Google Maps client for one relocation: nearby search, place details,
 /// geocoding and shared-link resolution through an injectable transport,
-/// every request counted in `api_usage`.
+/// every request gated by the configured caps and counted in `api_usage`.
 pub struct GoogleMapsClient<'a> {
     pub transport: &'a dyn HttpTransport,
     pub pool: &'a SqlitePool,
     pub relocation_id: i64,
     pub api_key: &'a str,
+    pub caps: Caps,
 }
 
 impl GoogleMapsClient<'_> {
@@ -422,13 +428,16 @@ impl GoogleMapsClient<'_> {
             .ok_or(GoogleMapsError::MissingPlaceId)
     }
 
-    /// One counted request: bumps `api_usage` first, then GETs through the
-    /// transport-level retry.
+    /// One counted request: refuses past a configured cap, bumps
+    /// `api_usage`, then GETs through the transport-level retry.
     async fn get(
         &self,
         url: &str,
         params: &[(&str, String)],
     ) -> Result<HttpResponse, GoogleMapsError> {
+        api_usage::check_cap(self.pool, self.relocation_id, Provider::Google, self.caps)
+            .await
+            .map_err(GoogleMapsError::Cap)?;
         api_usage::record_request(self.pool, self.relocation_id, Provider::Google)
             .await
             .map_err(GoogleMapsError::Usage)?;
