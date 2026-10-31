@@ -1,6 +1,7 @@
 //! NextHome: accounts, members, API keys, the relocation lifecycle, the
-//! locations it tracks, the walking isochrones generated for them, usage
-//! caps, the map provider clients and the background job loop.
+//! locations it tracks, the walking isochrones generated for them and
+//! the heatmaps built from those, usage caps, the map provider clients
+//! and the background job loop.
 
 pub mod accounts;
 pub mod api_keys;
