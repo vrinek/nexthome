@@ -93,8 +93,7 @@ pub enum LocationError {
         place_type_id: i64,
         relocation_id: i64,
     },
-    /// The member does not belong to the relocation's account, so their
-    /// writes do not belong to the relocation.
+    /// The member does not belong to the relocation's account.
     MemberNotInAccount { member_id: i64 },
     /// Neither provider geocoded the address within one degree of the
     /// relocation's city.

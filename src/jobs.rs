@@ -277,14 +277,14 @@ async fn isochrones(pool: &SqlitePool, payload: &Value) -> Result<(), JobError> 
 }
 
 /// The populate job: fills a place type with nearby places around a
-/// center. Creating those locations is PLAN.md task 8's; until it lands,
-/// the job only checks its referent — the place type must exist in the
-/// relocation.
+/// center. Creating those locations needs a Google client in the job
+/// loop, which has none yet; until then, the job only checks its
+/// referent — the place type must exist in the relocation.
 async fn populate(pool: &SqlitePool, payload: &Value) -> Result<(), JobError> {
     let relocation_id = integer_field(payload, "relocation_id")?;
     let place_type_id = integer_field(payload, "place_type_id")?;
-    // The center fields are checked now and used once task 8's location
-    // writes land; both must be numbers.
+    // The center fields are checked now and used once the job creates
+    // locations; both must be numbers.
     let _lat = number_field(payload, "lat")?;
     let _lon = number_field(payload, "lon")?;
     let found: Option<i64> =
