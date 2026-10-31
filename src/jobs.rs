@@ -2,8 +2,12 @@
 //! atomic claim the loop claims through — one job at a time — and the
 //! three job kinds it runs.
 
+use std::fmt;
+
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
+
+use crate::relocations;
 
 /// The `jobs.kind` the isochrones job carries: walking isochrones for one
 /// location.
@@ -24,6 +28,63 @@ const MAX_ATTEMPTS: i64 = 5;
 /// after the lease rather than straight away, and no second claimer can
 /// take a job while it runs.
 const CLAIM_LEASE_SECONDS: i64 = 600;
+
+/// The seconds to wait before the next attempt, by the attempt that just
+/// failed: ten seconds after the first, doubling each time.
+const RETRY_BACKOFF_SECONDS: [i64; 4] = [10, 20, 40, 80];
+
+/// Why a job run failed; the message lands in the job's `last_error`.
+#[derive(Debug)]
+enum JobError {
+    /// The row's kind is none the loop knows.
+    UnknownKind(String),
+    /// The payload is not the JSON its kind carries.
+    Payload(String),
+    /// No location has the id the isochrones job names.
+    MissingLocation(i64),
+    /// No place type has the id the populate job names in its relocation.
+    MissingPlaceType {
+        relocation_id: i64,
+        place_type_id: i64,
+    },
+    /// A database operation behind the job failed.
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for JobError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl fmt::Display for JobError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownKind(kind) => write!(formatter, "unknown job kind: {kind}"),
+            Self::Payload(detail) => write!(formatter, "malformed payload: {detail}"),
+            Self::MissingLocation(location_id) => {
+                write!(formatter, "no location exists with id {location_id}")
+            }
+            Self::MissingPlaceType {
+                relocation_id,
+                place_type_id,
+            } => write!(
+                formatter,
+                "no place type {place_type_id} exists in relocation {relocation_id}"
+            ),
+            Self::Database(error) => write!(formatter, "database operation failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for JobError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// A claimed job: the row as the claim returned it, with `attempts`
 /// already counting the attempt that is about to run.
@@ -116,4 +177,121 @@ pub async fn claim(pool: &SqlitePool) -> Result<Option<Job>, sqlx::Error> {
         payload,
         attempts,
     }))
+}
+
+/// Runs the next due job, if one is: claims it, executes it, and records
+/// the outcome — `done_at` on success, `last_error` and the next backoff
+/// on failure. A job that fails five times keeps its last error and is
+/// never claimed again. Returns whether a job ran.
+pub async fn process_next(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let Some(job) = claim(pool).await? else {
+        return Ok(false);
+    };
+    match execute(pool, &job).await {
+        Ok(()) => {
+            sqlx::query(
+                "UPDATE jobs SET done_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+            )
+            .bind(job.id)
+            .execute(pool)
+            .await?;
+        }
+        Err(error) => {
+            tracing::warn!(job_id = job.id, attempt = job.attempts, %error, "job failed");
+            if job.attempts < MAX_ATTEMPTS {
+                let backoff = RETRY_BACKOFF_SECONDS[(job.attempts - 1) as usize];
+                sqlx::query(
+                    "UPDATE jobs
+                     SET last_error = ?,
+                         run_after = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)
+                     WHERE id = ?",
+                )
+                .bind(error.to_string())
+                .bind(format!("+{backoff} seconds"))
+                .bind(job.id)
+                .execute(pool)
+                .await?;
+            } else {
+                // The last attempt failed; the claim's attempts filter
+                // keeps the job unclaimed from here on.
+                sqlx::query("UPDATE jobs SET last_error = ? WHERE id = ?")
+                    .bind(error.to_string())
+                    .bind(job.id)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Runs one claimed job by its kind.
+async fn execute(pool: &SqlitePool, job: &Job) -> Result<(), JobError> {
+    let payload: Value = serde_json::from_str(&job.payload)
+        .map_err(|error| JobError::Payload(format!("payload is not valid JSON: {error}")))?;
+    match job.kind.as_str() {
+        KIND_ISOCHRONES => isochrones(pool, &payload).await,
+        KIND_POPULATE => populate(pool, &payload).await,
+        KIND_ARCHIVE_EXPIRED => {
+            relocations::archive_expired(pool).await?;
+            Ok(())
+        }
+        unknown => Err(JobError::UnknownKind(unknown.to_owned())),
+    }
+}
+
+/// The isochrones job: walking isochrones for one location. The contour
+/// generation is PLAN.md task 9's; until it lands, the job only checks
+/// its referent — a location that no longer exists fails the job, and
+/// one that exists completes it.
+async fn isochrones(pool: &SqlitePool, payload: &Value) -> Result<(), JobError> {
+    let location_id = integer_field(payload, "location_id")?;
+    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM locations WHERE id = ?")
+        .bind(location_id)
+        .fetch_optional(pool)
+        .await?;
+    if found.is_none() {
+        return Err(JobError::MissingLocation(location_id));
+    }
+    Ok(())
+}
+
+/// The populate job: fills a place type with nearby places around a
+/// center. Creating those locations is PLAN.md task 8's; until it lands,
+/// the job only checks its referent — the place type must exist in the
+/// relocation.
+async fn populate(pool: &SqlitePool, payload: &Value) -> Result<(), JobError> {
+    let relocation_id = integer_field(payload, "relocation_id")?;
+    let place_type_id = integer_field(payload, "place_type_id")?;
+    // The center fields are checked now and used once task 8's location
+    // writes land; both must be numbers.
+    let _lat = number_field(payload, "lat")?;
+    let _lon = number_field(payload, "lon")?;
+    let found: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM place_types WHERE id = ? AND relocation_id = ?")
+            .bind(place_type_id)
+            .bind(relocation_id)
+            .fetch_optional(pool)
+            .await?;
+    if found.is_none() {
+        return Err(JobError::MissingPlaceType {
+            relocation_id,
+            place_type_id,
+        });
+    }
+    Ok(())
+}
+
+/// The payload's integer field, or the payload error naming it.
+fn integer_field(payload: &Value, name: &str) -> Result<i64, JobError> {
+    payload[name]
+        .as_i64()
+        .ok_or_else(|| JobError::Payload(format!("the {name} field must be a whole number")))
+}
+
+/// The payload's number field, or the payload error naming it.
+fn number_field(payload: &Value, name: &str) -> Result<f64, JobError> {
+    payload[name]
+        .as_f64()
+        .ok_or_else(|| JobError::Payload(format!("the {name} field must be a number")))
 }
