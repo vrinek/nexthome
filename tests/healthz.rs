@@ -18,6 +18,9 @@ async fn healthz_runs_migrations_and_checks_sqlite() {
     let mut server = Command::new(env!("CARGO_BIN_EXE_nexthome"))
         .env("BIND", "127.0.0.1:0")
         .env("DATABASE_URL", &database_url)
+        // The server refuses to start without its Mapbox token; the
+        // health check never reaches Mapbox with it.
+        .env("MAPBOX_TOKEN", "test-token")
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()

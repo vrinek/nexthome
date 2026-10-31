@@ -6,12 +6,14 @@
 // never touches looks dead to it.
 #![allow(dead_code)]
 
-use std::{collections::VecDeque, str::FromStr, sync::Mutex};
+use std::{collections::VecDeque, str::FromStr, sync::Arc, sync::Mutex};
 
 use async_trait::async_trait;
 use nexthome::{
     accounts,
+    api_usage::Caps,
     http::{HttpResponse, HttpTransport, TransportError},
+    mapbox::MapboxAccess,
     relocations,
 };
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
@@ -45,6 +47,54 @@ pub async fn relocated_pool() -> (tempfile::TempDir, SqlitePool, i64) {
             .await
             .unwrap();
     (directory, pool, relocation_id)
+}
+
+/// One locations row under the relocation, straight at the given
+/// position: the quietest way to give a job or a contour something to
+/// hang off — no provider calls, nothing enqueued.
+pub async fn insert_location(
+    pool: &SqlitePool,
+    relocation_id: i64,
+    place_type_id: Option<i64>,
+    lat: f64,
+    lon: f64,
+) -> i64 {
+    let member_id: i64 = sqlx::query_scalar("SELECT id FROM members ORDER BY id LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query_scalar(
+        "INSERT INTO locations (relocation_id, place_type_id, member_id, name, lat, lon,
+                                created_at, updated_at)
+         VALUES (?, ?, ?, 'Alex office', ?, ?,
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+         RETURNING id",
+    )
+    .bind(relocation_id)
+    .bind(place_type_id)
+    .bind(member_id)
+    .bind(lat)
+    .bind(lon)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The Mapbox access the job loop's callers bring, over a fake transport
+/// the test scripts itself: a test token and unlimited caps.
+pub fn mapbox_access(transport: Arc<FakeTransport>) -> MapboxAccess {
+    MapboxAccess {
+        transport,
+        access_token: "test-token".to_owned(),
+        caps: Caps::default(),
+    }
+}
+
+/// The Mapbox access over a fake transport nothing is scripted onto:
+/// jobs that make no Mapbox request never touch it, and one that
+/// unexpectedly does panics the fake rather than calling out.
+pub fn untouched_mapbox_access() -> MapboxAccess {
+    mapbox_access(Arc::new(FakeTransport::new()))
 }
 
 /// A recorded provider response body from `tests/fixtures`, as read from

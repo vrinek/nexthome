@@ -1,4 +1,4 @@
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -63,6 +63,19 @@ impl std::error::Error for MapboxError {
             _ => None,
         }
     }
+}
+
+/// The Mapbox access a caller brings before it can know which
+/// relocation a request counts against: the transport the requests go
+/// out on, the token they carry, and the caps that gate them. A
+/// [`MapboxClient`] is built from it once the relocation is known.
+pub struct MapboxAccess {
+    /// The HTTP layer the requests go through.
+    pub transport: Arc<dyn HttpTransport>,
+    /// The access token every request carries.
+    pub access_token: String,
+    /// The monthly caps every request passes.
+    pub caps: Caps,
 }
 
 /// The Mapbox client for one relocation: geocoding and isochrones through an

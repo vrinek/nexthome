@@ -1,7 +1,9 @@
-use std::{env, error::Error, str::FromStr, time::Duration};
+use std::{env, error::Error, str::FromStr, sync::Arc, time::Duration};
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
-use nexthome::{auth::AuthenticatedMember, jobs};
+use nexthome::{
+    api_usage::Caps, auth::AuthenticatedMember, http::ReqwestTransport, jobs, mapbox::MapboxAccess,
+};
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -21,7 +23,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .connect_with(options)
         .await?;
     sqlx::migrate!().run(&pool).await?;
-    tokio::spawn(jobs::run(pool.clone()));
+    // The job loop generates isochrones through Mapbox: the transport,
+    // the `MAPBOX_TOKEN` variable and the configured caps make up its
+    // access, and a missing token is a startup error — no location could
+    // ever get a contour without it.
+    let mapbox = MapboxAccess {
+        transport: Arc::new(ReqwestTransport::new()),
+        access_token: env::var("MAPBOX_TOKEN")?,
+        caps: Caps::from_env()?,
+    };
+    tokio::spawn(jobs::run(pool.clone(), mapbox));
 
     let app = Router::new()
         .route("/healthz", get(healthz))
