@@ -1000,12 +1000,15 @@ async fn updating_state_note_and_name_leaves_the_position_jobs_and_evaluations_a
     .await;
     insert_evaluation(&pool, location_id).await;
 
+    // A refusal is the one state change that cannot invalidate: only a
+    // place becoming accepted — a place type gaining an accepted place —
+    // deletes stored evaluations.
     locations::update(
         &pool,
         relocation_id,
         location_id,
         LocationChanges {
-            state: Some(State::Accepted),
+            state: Some(State::Rejected),
             note: Some("great light"),
             name: Some("Home, Mitte"),
             coordinates: None,
@@ -1017,7 +1020,7 @@ async fn updating_state_note_and_name_leaves_the_position_jobs_and_evaluations_a
     let (_, _, _, name, lat, lon, state, note, ..) = location_row(&pool, location_id).await;
     assert_eq!(name, "Home, Mitte");
     assert_eq!((lat, lon), (52.52, 13.405));
-    assert_eq!(state, "accepted");
+    assert_eq!(state, "rejected");
     assert_eq!(note.as_deref(), Some("great light"));
     assert_eq!(isochrones_job_count(&pool, location_id).await, 1);
     assert_eq!(evaluation_count(&pool, location_id).await, 1);

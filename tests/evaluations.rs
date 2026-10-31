@@ -12,7 +12,9 @@ use common::{FakeTransport, fixture, relocated_pool};
 use nexthome::{
     api_usage::Caps,
     evaluations::{self, EvaluationRow, render},
+    geo::Coordinates,
     google_maps::GoogleMapsClient,
+    locations::{self, LocationChanges, State},
 };
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -103,6 +105,15 @@ async fn stored_rows(pool: &SqlitePool, location_id: i64) -> Vec<EvaluationRow> 
         .await
         .unwrap();
     serde_json::from_str(&rows).unwrap()
+}
+
+/// How many evaluations stand stored for the location.
+async fn evaluation_count(pool: &SqlitePool, location_id: i64) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM evaluations WHERE location_id = ?")
+        .bind(location_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 /// The relocation's counted Google requests this month.
@@ -573,6 +584,188 @@ async fn the_walking_band_comes_from_the_destination_s_stored_isochrones() {
             ),
         }
     }
+}
+
+#[tokio::test]
+async fn moving_the_location_deletes_its_stored_evaluation_and_recomputes() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let gym = place_type_id(&pool, relocation_id, "Gym").await;
+    let apartment = place_type_id(&pool, relocation_id, "Apartment").await;
+    insert_location(
+        &pool,
+        relocation_id,
+        Some(gym),
+        "Urban Apes",
+        52.5219,
+        13.4139,
+        "accepted",
+    )
+    .await;
+    let home = insert_location(
+        &pool,
+        relocation_id,
+        Some(apartment),
+        "Inselstraße 10",
+        52.52,
+        13.405,
+        "inbox",
+    )
+    .await;
+    for _ in 0..3 {
+        push_matrix(&transport, &[Some(600)]);
+    }
+    let first = evaluate(&pool, &transport, relocation_id, home)
+        .await
+        .unwrap();
+    assert_eq!(evaluation_count(&pool, home).await, 1);
+
+    // The move invalidates the stored table; the next call computes a
+    // fresh one, which the scripted 20-minute answer shows.
+    locations::update(
+        &pool,
+        relocation_id,
+        home,
+        LocationChanges {
+            coordinates: Some(Coordinates {
+                lat: 52.531,
+                lng: 13.41,
+            }),
+            ..LocationChanges::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        evaluation_count(&pool, home).await,
+        0,
+        "the move invalidates the stored evaluation"
+    );
+    for _ in 0..3 {
+        push_matrix(&transport, &[Some(1200)]);
+    }
+    let second = evaluate(&pool, &transport, relocation_id, home)
+        .await
+        .unwrap();
+    assert_ne!(
+        second, first,
+        "the table after the move is a fresh computation"
+    );
+    assert_eq!(evaluation_count(&pool, home).await, 1);
+}
+
+#[tokio::test]
+async fn a_place_type_gaining_an_accepted_place_invalidates_the_relocation_s_evaluations() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let gym = place_type_id(&pool, relocation_id, "Gym").await;
+    let apartment = place_type_id(&pool, relocation_id, "Apartment").await;
+    // One accepted gym and two evaluated flats, both tables stored.
+    insert_location(
+        &pool,
+        relocation_id,
+        Some(gym),
+        "Urban Apes",
+        52.5219,
+        13.4139,
+        "accepted",
+    )
+    .await;
+    let first_flat = insert_location(
+        &pool,
+        relocation_id,
+        Some(apartment),
+        "Inselstraße 10",
+        52.52,
+        13.405,
+        "inbox",
+    )
+    .await;
+    let second_flat = insert_location(
+        &pool,
+        relocation_id,
+        Some(apartment),
+        "Turmstraße 1",
+        52.5303,
+        13.345,
+        "inbox",
+    )
+    .await;
+    for flat in [first_flat, second_flat] {
+        for _ in 0..3 {
+            push_matrix(&transport, &[Some(900)]);
+        }
+        evaluate(&pool, &transport, relocation_id, flat)
+            .await
+            .unwrap();
+        assert_eq!(evaluation_count(&pool, flat).await, 1);
+    }
+
+    // A second gym joins the accepted set: every stored table in the
+    // relocation is stale — the new place may be nearer than the ones
+    // the tables list — so all of them go, not only tables that name
+    // the new place's type.
+    let new_gym = insert_location(
+        &pool,
+        relocation_id,
+        Some(gym),
+        "Yoga room",
+        52.522,
+        13.404,
+        "inbox",
+    )
+    .await;
+    locations::update(
+        &pool,
+        relocation_id,
+        new_gym,
+        LocationChanges {
+            state: Some(State::Accepted),
+            ..LocationChanges::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        evaluation_count(&pool, first_flat).await,
+        0,
+        "the acceptance invalidates every table in the relocation"
+    );
+    assert_eq!(evaluation_count(&pool, second_flat).await, 0);
+
+    // A state change that is not into accepted leaves stored tables
+    // alone.
+    for flat in [first_flat, second_flat] {
+        for _ in 0..3 {
+            push_matrix(&transport, &[Some(900), Some(900)]);
+        }
+        evaluate(&pool, &transport, relocation_id, flat)
+            .await
+            .unwrap();
+    }
+    let rejected = insert_location(
+        &pool,
+        relocation_id,
+        Some(gym),
+        "Closed gym",
+        52.5225,
+        13.4045,
+        "inbox",
+    )
+    .await;
+    locations::update(
+        &pool,
+        relocation_id,
+        rejected,
+        LocationChanges {
+            state: Some(State::Rejected),
+            ..LocationChanges::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(evaluation_count(&pool, first_flat).await, 1);
+    assert_eq!(evaluation_count(&pool, second_flat).await, 1);
 }
 
 #[tokio::test]
