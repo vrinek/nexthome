@@ -1000,9 +1000,9 @@ async fn updating_state_note_and_name_leaves_the_position_jobs_and_evaluations_a
     .await;
     insert_evaluation(&pool, location_id).await;
 
-    // A refusal is the one state change that cannot invalidate: only a
-    // place becoming accepted — a place type gaining an accepted place —
-    // deletes stored evaluations.
+    // A state change that is not into accepted leaves stored
+    // evaluations alone: only a place type gaining an accepted place
+    // deletes them.
     locations::update(
         &pool,
         relocation_id,

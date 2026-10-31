@@ -505,13 +505,7 @@ async fn the_second_call_reads_the_stored_table_and_makes_no_request() {
         "the cache answers without a request"
     );
     assert_eq!(google_calls(&pool, relocation_id).await, 3);
-    let evaluations_stored: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM evaluations WHERE location_id = ?")
-            .bind(home)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(evaluations_stored, 1);
+    assert_eq!(evaluation_count(&pool, home).await, 1);
 }
 
 #[tokio::test]
