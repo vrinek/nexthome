@@ -770,6 +770,59 @@ async fn a_place_type_gaining_an_accepted_place_invalidates_the_relocation_s_eva
 }
 
 #[tokio::test]
+async fn re_sending_accepted_for_an_already_accepted_place_keeps_stored_evaluations() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let gym = place_type_id(&pool, relocation_id, "Gym").await;
+    let apartment = place_type_id(&pool, relocation_id, "Apartment").await;
+    // An accepted gym, and a stored table for the flat under it.
+    let accepted_gym = insert_location(
+        &pool,
+        relocation_id,
+        Some(gym),
+        "Urban Apes",
+        52.5219,
+        13.4139,
+        "accepted",
+    )
+    .await;
+    let home = insert_location(
+        &pool,
+        relocation_id,
+        Some(apartment),
+        "Inselstraße 10",
+        52.52,
+        13.405,
+        "inbox",
+    )
+    .await;
+    for _ in 0..3 {
+        push_matrix(&transport, &[Some(900)]);
+    }
+    evaluate(&pool, &transport, relocation_id, home)
+        .await
+        .unwrap();
+    assert_eq!(evaluation_count(&pool, home).await, 1);
+
+    // An edit that re-sends accepted — a note change on a place the
+    // relocation already counts as accepted — is no transition, so no
+    // table goes.
+    locations::update(
+        &pool,
+        relocation_id,
+        accepted_gym,
+        LocationChanges {
+            state: Some(State::Accepted),
+            note: Some("opens late"),
+            ..LocationChanges::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(evaluation_count(&pool, home).await, 1);
+}
+
+#[tokio::test]
 async fn evaluating_refuses_a_location_of_another_relocation() {
     let (_directory, pool, relocation_id) = relocated_pool().await;
     let transport = FakeTransport::new();
