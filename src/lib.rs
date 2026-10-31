@@ -1,5 +1,5 @@
 //! NextHome: accounts, members, API keys, the relocation lifecycle, usage
-//! caps and the map provider clients.
+//! caps, the map provider clients and the background job loop.
 
 pub mod accounts;
 pub mod api_keys;
@@ -8,5 +8,6 @@ pub mod auth;
 pub mod geo;
 pub mod google_maps;
 pub mod http;
+pub mod jobs;
 pub mod mapbox;
 pub mod relocations;
