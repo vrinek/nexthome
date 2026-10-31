@@ -15,6 +15,7 @@ use nexthome::{
     geo::Coordinates,
     google_maps::GoogleMapsClient,
     locations::{self, LocationChanges, State},
+    relocations,
 };
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -766,6 +767,56 @@ async fn a_place_type_gaining_an_accepted_place_invalidates_the_relocation_s_eva
     .unwrap();
     assert_eq!(evaluation_count(&pool, first_flat).await, 1);
     assert_eq!(evaluation_count(&pool, second_flat).await, 1);
+}
+
+#[tokio::test]
+async fn evaluating_refuses_a_location_of_another_relocation() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let gym = place_type_id(&pool, relocation_id, "Gym").await;
+    let apartment = place_type_id(&pool, relocation_id, "Apartment").await;
+    insert_location(
+        &pool,
+        relocation_id,
+        Some(gym),
+        "Urban Apes",
+        52.5219,
+        13.4139,
+        "accepted",
+    )
+    .await;
+    let home = insert_location(
+        &pool,
+        relocation_id,
+        Some(apartment),
+        "Inselstraße 10",
+        52.52,
+        13.405,
+        "inbox",
+    )
+    .await;
+    // A second relocation of the same account, whose client the call
+    // brings: the evaluation must neither read the Berlin flat's
+    // places nor bill its matrix calls to Vienna.
+    let account_id: i64 = sqlx::query_scalar("SELECT account_id FROM relocations WHERE id = ?")
+        .bind(relocation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let vienna_id = relocations::create(&pool, account_id, "Vienna", 48.208, 16.373, 11.0)
+        .await
+        .unwrap();
+
+    let error = evaluate(&pool, &transport, vienna_id, home)
+        .await
+        .expect_err("an evaluation cannot read or bill across relocations");
+
+    assert_eq!(
+        error.to_string(),
+        format!("no location exists with id {home} in relocation {vienna_id}")
+    );
+    assert!(transport.recorded_gets().is_empty());
+    assert_eq!(evaluation_count(&pool, home).await, 0);
 }
 
 #[tokio::test]

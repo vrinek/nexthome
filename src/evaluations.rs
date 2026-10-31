@@ -131,6 +131,12 @@ fn push_column(line: &mut String, text: &str, width: usize) {
 pub enum EvaluationError {
     /// No location has the given id.
     MissingLocation(i64),
+    /// The location belongs to another relocation than the one the
+    /// evaluation's Google requests count against.
+    LocationNotInRelocation {
+        location_id: i64,
+        relocation_id: i64,
+    },
     /// A Google Maps request behind the evaluation failed.
     Google(GoogleMapsError),
     /// A stored evaluation's rows are not the JSON this module writes.
@@ -145,6 +151,13 @@ impl fmt::Display for EvaluationError {
             Self::MissingLocation(location_id) => {
                 write!(formatter, "no location exists with id {location_id}")
             }
+            Self::LocationNotInRelocation {
+                location_id,
+                relocation_id,
+            } => write!(
+                formatter,
+                "no location exists with id {location_id} in relocation {relocation_id}"
+            ),
             Self::Google(error) => write!(formatter, "{error}"),
             Self::Unparseable(error) => {
                 write!(
@@ -163,7 +176,7 @@ impl std::error::Error for EvaluationError {
             Self::Google(error) => Some(error),
             Self::Unparseable(error) => Some(error),
             Self::Database(error) => Some(error),
-            Self::MissingLocation(_) => None,
+            Self::MissingLocation(_) | Self::LocationNotInRelocation { .. } => None,
         }
     }
 }
@@ -182,13 +195,22 @@ impl From<GoogleMapsError> for EvaluationError {
 
 /// The location's travel-time table as text, computed on the first
 /// call and read back from `evaluations` after: per place type, the
-/// three nearest accepted places with their minutes by each mode.
+/// three nearest accepted places with their minutes by each mode. The
+/// location must belong to the relocation the client's requests count
+/// against — a location of another relocation is not found, the way
+/// the other location writes scope themselves.
 pub async fn evaluate(
     pool: &SqlitePool,
     google: &GoogleMapsClient<'_>,
     location_id: i64,
 ) -> Result<String, EvaluationError> {
     let location = location_by_id(pool, location_id).await?;
+    if location.relocation_id != google.relocation_id {
+        return Err(EvaluationError::LocationNotInRelocation {
+            location_id,
+            relocation_id: google.relocation_id,
+        });
+    }
     let place_types = place_types(pool, location.relocation_id).await?;
     if let Some(rows) = stored_rows(pool, location_id).await? {
         return Ok(render(&location.name, &names(&place_types), &rows));
