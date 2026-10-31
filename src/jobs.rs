@@ -184,9 +184,10 @@ pub async fn claim(pool: &SqlitePool) -> Result<Option<Job>, sqlx::Error> {
 }
 
 /// Runs the next due job, if one is: claims it, executes it, and records
-/// the outcome — `done_at` on success, `last_error` and the next backoff
-/// on failure. A job that fails five times keeps its last error and is
-/// never claimed again. Returns whether a job ran.
+/// the outcome — `done_at` and a cleared `last_error` on success,
+/// `last_error` and the next backoff on failure. A job that fails five
+/// times keeps its last error and is never claimed again. Returns
+/// whether a job ran.
 pub async fn process_next(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
     let Some(job) = claim(pool).await? else {
         return Ok(false);
@@ -194,7 +195,10 @@ pub async fn process_next(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
     match execute(pool, &job).await {
         Ok(()) => {
             sqlx::query(
-                "UPDATE jobs SET done_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+                "UPDATE jobs
+                 SET done_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                     last_error = NULL
+                 WHERE id = ?",
             )
             .bind(job.id)
             .execute(pool)

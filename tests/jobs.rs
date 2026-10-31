@@ -214,6 +214,56 @@ async fn a_job_that_succeeds_is_marked_done_and_not_claimed_again() {
 }
 
 #[tokio::test]
+async fn a_job_that_succeeds_on_a_retry_clears_its_last_error() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+
+    // The job's location does not exist yet, so the first attempt fails.
+    let location_id = 999;
+    let job_id = jobs::enqueue_isochrones(&pool, location_id).await.unwrap();
+    assert!(jobs::process_next(&pool).await.unwrap(), "the job is due");
+    let (attempts, last_error, done_at) = job_row(&pool, job_id).await;
+    assert_eq!(attempts, 1);
+    assert_eq!(
+        last_error.as_deref(),
+        Some("no location exists with id 999")
+    );
+    assert!(done_at.is_none(), "a failed job is not done");
+
+    // The location the job names appears, and the backoff passes.
+    let member_id: i64 = sqlx::query_scalar("SELECT id FROM members")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO locations (id, relocation_id, place_type_id, member_id, name, lat, lon,
+                                created_at, updated_at)
+         VALUES (?, ?, NULL, ?, 'Alex office', 52.52, 13.405,
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+    )
+    .bind(location_id)
+    .bind(relocation_id)
+    .bind(member_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    backoff_elapsed(&pool, job_id).await;
+
+    // The retry succeeds: the job is done, its earlier failure is
+    // cleared, and it is never claimed again.
+    assert!(jobs::process_next(&pool).await.unwrap(), "the retry is due");
+    let (attempts, last_error, done_at) = job_row(&pool, job_id).await;
+    assert_eq!(attempts, 2, "the retry is the second attempt");
+    let done_at = done_at.expect("the retry succeeded");
+    assert_eq!(done_at.len(), 20);
+    assert!(done_at.ends_with('Z'));
+    assert_eq!(last_error, None, "a completed row must not read as failed");
+    assert!(
+        !jobs::process_next(&pool).await.unwrap(),
+        "a done job is not claimable again"
+    );
+}
+
+#[tokio::test]
 async fn the_archive_expired_job_runs_the_archiver() {
     let (_directory, pool, relocation_id) = relocated_pool().await;
     // Paid seven months ago, so expired a month ago.
