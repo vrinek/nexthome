@@ -278,7 +278,7 @@ pub async fn add(
         ensure_unique_external_identifier(&mut *transaction, relocation_id, external_identifier)
             .await?;
     }
-    let location_id: i64 = sqlx::query_scalar(
+    let inserted: Result<i64, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO locations
             (relocation_id, place_type_id, member_id, name, lat, lon, state, note,
              source_url, external_identifier, google_maps_payload, created_at, updated_at)
@@ -299,7 +299,9 @@ pub async fn add(
     .bind(external_identifier)
     .bind(resolved.google_maps_payload.as_deref())
     .fetch_one(&mut *transaction)
-    .await?;
+    .await;
+    let location_id =
+        inserted.map_err(|error| duplicate_refusal_or(error, source_url, external_identifier))?;
     jobs::enqueue_isochrones(&mut *transaction, location_id).await?;
     transaction.commit().await?;
     Ok(location_id)
@@ -742,4 +744,168 @@ where
         ));
     }
     Ok(())
+}
+
+/// The insert failure mapped to the duplicate refusal when the schema's
+/// own UNIQUE constraint is what fired: a concurrent add on another
+/// connection can slip between the in-transaction pre-check and the
+/// insert, and the losing write still deserves the friendly refusal,
+/// not the raw database error. Any other failure passes through
+/// untouched.
+fn duplicate_refusal_or(
+    error: sqlx::Error,
+    source_url: Option<&str>,
+    external_identifier: Option<&str>,
+) -> LocationError {
+    if let sqlx::Error::Database(database_error) = &error {
+        let message = database_error.message();
+        if message.contains("UNIQUE constraint failed")
+            && let Some(source_url) = source_url
+            && message.contains("locations.source_url")
+        {
+            return LocationError::DuplicateSourceUrl(source_url.to_owned());
+        }
+        if message.contains("UNIQUE constraint failed")
+            && let Some(external_identifier) = external_identifier
+            && message.contains("locations.external_identifier")
+        {
+            return LocationError::DuplicateExternalIdentifier(external_identifier.to_owned());
+        }
+    }
+    LocationError::Database(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LocationError, duplicate_refusal_or};
+    use crate::{accounts, relocations};
+
+    /// A migrated pool over its own temporary database, with an account,
+    /// its first member and one Berlin relocation to hang rows off.
+    async fn migrated_pool() -> (tempfile::TempDir, sqlx::SqlitePool, i64, i64) {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("nexthome.db").display()
+        );
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let created = accounts::create_with_first_member(&pool, "mover@example.com")
+            .await
+            .unwrap();
+        let relocation_id =
+            relocations::create(&pool, created.account_id, "Berlin", 52.52, 13.405, 11.5)
+                .await
+                .unwrap();
+        (directory, pool, relocation_id, created.member_id)
+    }
+
+    /// Inserts a locations row under the relocation with the given source
+    /// url and external identifier; only the UNIQUE constraints can stop
+    /// it.
+    async fn insert_row(
+        pool: &sqlx::SqlitePool,
+        relocation_id: i64,
+        member_id: i64,
+        source_url: &str,
+        external_identifier: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO locations (relocation_id, member_id, name, lat, lon, state,
+                                    source_url, external_identifier, created_at, updated_at)
+             VALUES (?, ?, 'Somewhere', 52.52, 13.405, 'inbox', ?, ?,
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        )
+        .bind(relocation_id)
+        .bind(member_id)
+        .bind(source_url)
+        .bind(external_identifier)
+        .execute(pool)
+        .await
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn a_unique_violation_at_the_insert_reads_as_the_friendly_duplicate_refusal() {
+        let (_directory, pool, relocation_id, member_id) = migrated_pool().await;
+        insert_row(
+            &pool,
+            relocation_id,
+            member_id,
+            "https://example.com/a",
+            "google_maps:place_id:first",
+        )
+        .await
+        .unwrap();
+        insert_row(
+            &pool,
+            relocation_id,
+            member_id,
+            "https://example.com/b",
+            "google_maps:place_id:second",
+        )
+        .await
+        .unwrap();
+
+        // The source url collides; the identifier does not. The refusal
+        // names the url, not the identifier that stood.
+        let error = insert_row(
+            &pool,
+            relocation_id,
+            member_id,
+            "https://example.com/a",
+            "google_maps:place_id:third",
+        )
+        .await
+        .unwrap_err();
+        let refusal = duplicate_refusal_or(
+            error,
+            Some("https://example.com/a"),
+            Some("google_maps:place_id:third"),
+        );
+        assert!(
+            matches!(
+                refusal,
+                LocationError::DuplicateSourceUrl(ref url) if url == "https://example.com/a"
+            ),
+            "expected a duplicate-source-url refusal, got: {refusal}"
+        );
+
+        // The external identifier collides; the url does not.
+        let error = insert_row(
+            &pool,
+            relocation_id,
+            member_id,
+            "https://example.com/c",
+            "google_maps:place_id:second",
+        )
+        .await
+        .unwrap_err();
+        let refusal = duplicate_refusal_or(
+            error,
+            Some("https://example.com/c"),
+            Some("google_maps:place_id:second"),
+        );
+        assert!(
+            matches!(
+                refusal,
+                LocationError::DuplicateExternalIdentifier(ref identifier)
+                    if identifier == "google_maps:place_id:second"
+            ),
+            "expected a duplicate-external-identifier refusal, got: {refusal}"
+        );
+
+        // Anything that is not a unique violation passes through as the
+        // database error it is.
+        let other = duplicate_refusal_or(
+            sqlx::Error::RowNotFound,
+            Some("https://example.com/a"),
+            None,
+        );
+        assert!(
+            matches!(other, LocationError::Database(_)),
+            "expected the database error to pass through, got: {other}"
+        );
+    }
 }

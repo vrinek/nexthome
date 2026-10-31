@@ -474,6 +474,93 @@ async fn adding_from_an_address_is_refused_when_google_answers_far_from_the_city
 }
 
 #[tokio::test]
+async fn adding_from_an_address_trips_the_one_degree_bound_on_either_axis_alone() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let member_id = first_member_id(&pool).await;
+    let school_id = place_type_id(&pool, relocation_id, "School").await;
+
+    let at_address = |name: &'static str, address: &'static str| NewLocation {
+        name,
+        place_type_id: school_id,
+        note: None,
+        source_url: None,
+        placement: Placement::Address(address),
+    };
+
+    // Mapbox answers exactly one degree north of the city and dead on
+    // its longitude: the bound is inclusive, as the Rails `> 1` was, so
+    // Mapbox's own answer stands and no fallback runs.
+    transport.push_ok_get(
+        200,
+        r#"{"type": "FeatureCollection", "features": [{"center": [13.405, 53.52]}]}"#,
+    );
+    let one_degree_off = add_location(
+        &pool,
+        &transport,
+        relocation_id,
+        member_id,
+        at_address("One degree off", "Prinzstraße 1, Berlin"),
+    )
+    .await
+    .unwrap();
+    let (_, _, _, _, lat, lon, ..) = location_row(&pool, one_degree_off).await;
+    assert_eq!((lat, lon), (53.52, 13.405));
+    assert_eq!(transport.recorded_gets().len(), 1);
+
+    // An answer far on the latitude alone still trips the bound: Google
+    // geocodes next and its near answer is stored.
+    transport.push_ok_get(
+        200,
+        r#"{"type": "FeatureCollection", "features": [{"center": [13.405, 54.0]}]}"#,
+    );
+    transport.push_ok_get(200, &fixture("google_geocode.json"));
+    let from_google = add_location(
+        &pool,
+        &transport,
+        relocation_id,
+        member_id,
+        at_address("North of everywhere", "Seestraße 1, Berlin"),
+    )
+    .await
+    .unwrap();
+    let (_, _, _, _, lat, lon, ..) = location_row(&pool, from_google).await;
+    assert_eq!(
+        (lat, lon),
+        (52.5106, 13.4106),
+        "one axis alone past the bound sends the geocode to Google"
+    );
+    assert_eq!(transport.recorded_gets().len(), 3);
+
+    // A Google answer far on the longitude alone is refused all the
+    // same.
+    transport.push_ok_get(
+        200,
+        r#"{"type": "FeatureCollection", "features": [{"center": [13.405, 54.0]}]}"#,
+    );
+    transport.push_ok_get(
+        200,
+        r#"{"results": [{"geometry": {"location": {"lat": 52.5106, "lng": 14.5}}}],
+            "status": "OK"}"#,
+    );
+    let error = add_location(
+        &pool,
+        &transport,
+        relocation_id,
+        member_id,
+        at_address("East of everywhere", "Mühlenstraße 1, Berlin"),
+    )
+    .await
+    .expect_err("one axis alone past the bound is still too far");
+    assert!(
+        matches!(error, LocationError::TooFarFromCity { .. }),
+        "expected a too-far refusal, got: {error}"
+    );
+    assert_eq!(transport.recorded_gets().len(), 5);
+    assert_eq!(location_count(&pool, relocation_id).await, 2);
+}
+
+#[tokio::test]
 async fn adding_from_coordinates_needs_no_provider_call() {
     let (_directory, pool, relocation_id) = relocated_pool().await;
     // Nothing is scripted: any provider request fails the test.
@@ -1206,6 +1293,18 @@ async fn listing_narrows_by_state_place_type_and_bounding_box() {
         "booked",
     )
     .await;
+    // Waitlisted, and exactly on the box the test filters with later:
+    // its min_lat and its max_lng.
+    let corner = insert_location(
+        &pool,
+        relocation_id,
+        None,
+        "Corner flat",
+        52.51,
+        13.415,
+        "waitlisted",
+    )
+    .await;
 
     // A location under another relocation never appears.
     let account_id: i64 = sqlx::query_scalar("SELECT account_id FROM relocations WHERE id = ?")
@@ -1225,28 +1324,29 @@ async fn listing_narrows_by_state_place_type_and_bounding_box() {
         .unwrap();
     assert_eq!(
         all.iter().map(|location| location.id).collect::<Vec<_>>(),
-        vec![home, office, gym, flat]
+        vec![home, office, gym, flat, corner]
     );
 
-    // One row whole, field by field.
-    let office = &all[1];
-    assert_eq!(office.id, all[1].id);
-    assert_eq!(office.relocation_id, relocation_id);
-    assert_eq!(office.place_type_id, Some(school_id));
-    assert_eq!(office.member_id, member_id);
-    assert_eq!(office.name, "Alex office");
+    // One row whole, field by field: the second listed is the seeded
+    // office.
+    let listed_office = &all[1];
+    assert_eq!(listed_office.id, office);
+    assert_eq!(listed_office.relocation_id, relocation_id);
+    assert_eq!(listed_office.place_type_id, Some(school_id));
+    assert_eq!(listed_office.member_id, member_id);
+    assert_eq!(listed_office.name, "Alex office");
     assert_eq!(
-        office.coordinates,
+        listed_office.coordinates,
         Coordinates {
             lat: 52.53,
             lng: 13.41,
         }
     );
-    assert_eq!(office.state, State::Accepted);
-    assert!(office.note.is_none());
-    assert!(office.source_url.is_none());
-    assert!(office.external_identifier.is_none());
-    assert!(office.google_maps_payload.is_none());
+    assert_eq!(listed_office.state, State::Accepted);
+    assert!(listed_office.note.is_none());
+    assert!(listed_office.source_url.is_none());
+    assert!(listed_office.external_identifier.is_none());
+    assert!(listed_office.google_maps_payload.is_none());
 
     let inbox = locations::list(
         &pool,
@@ -1302,7 +1402,12 @@ async fn listing_narrows_by_state_place_type_and_bounding_box() {
     )
     .await
     .unwrap();
-    assert_eq!(names(&near_the_centre), ["Home", "Alex office"]);
+    // "Corner flat" sits exactly on the box's min_lat and max_lng: both
+    // bounds are inclusive.
+    assert_eq!(
+        names(&near_the_centre),
+        ["Home", "Alex office", "Corner flat"]
+    );
 
     let inbox_schools = locations::list(
         &pool,
