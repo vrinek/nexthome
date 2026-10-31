@@ -319,9 +319,11 @@ pub struct LocationChanges<'a> {
 
 /// Updates a location's state, note, name or position. Moving it — new
 /// coordinates — re-enqueues its isochrones job and deletes its stored
-/// evaluation, which the move has invalidated. The write goes through
-/// the archive guard and stays scoped: a location of another relocation
-/// is not found.
+/// evaluation, which the move has invalidated; a state change into
+/// accepted — a place type gaining an accepted place — deletes every
+/// stored evaluation in the relocation, which the new place may have
+/// made stale. The write goes through the archive guard and stays
+/// scoped: a location of another relocation is not found.
 pub async fn update(
     pool: &SqlitePool,
     relocation_id: i64,
@@ -331,6 +333,18 @@ pub async fn update(
     let moved = changes.coordinates.is_some();
     let mut transaction = pool.begin().await?;
     relocations::ensure_writable(&mut *transaction, relocation_id).await?;
+    // The state the update finds, read inside the write's transaction
+    // so it cannot change under it: only a transition into accepted —
+    // not a place the relocation already counts as accepted — gains
+    // the type an accepted place.
+    let current_state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM locations WHERE id = ? AND relocation_id = ?")
+            .bind(location_id)
+            .bind(relocation_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+    let becomes_accepted = changes.state == Some(State::Accepted)
+        && current_state.as_deref() != Some(State::Accepted.as_str());
 
     let mut assignments = vec!["updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"];
     if changes.state.is_some() {
@@ -377,6 +391,15 @@ pub async fn update(
             .bind(location_id)
             .execute(&mut *transaction)
             .await?;
+    }
+    if becomes_accepted {
+        sqlx::query(
+            "DELETE FROM evaluations WHERE location_id IN
+             (SELECT id FROM locations WHERE relocation_id = ?)",
+        )
+        .bind(relocation_id)
+        .execute(&mut *transaction)
+        .await?;
     }
     transaction.commit().await?;
     Ok(())
