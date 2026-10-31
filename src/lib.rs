@@ -1,5 +1,5 @@
-//! NextHome: accounts, members, API keys, the relocation lifecycle and the
-//! map provider clients.
+//! NextHome: accounts, members, API keys, the relocation lifecycle, usage
+//! caps and the map provider clients.
 
 pub mod accounts;
 pub mod api_keys;
