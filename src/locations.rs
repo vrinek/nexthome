@@ -410,6 +410,131 @@ pub async fn delete(
     Ok(())
 }
 
+/// One `locations` row, as [`list`] returns it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Location {
+    pub id: i64,
+    pub relocation_id: i64,
+    pub place_type_id: Option<i64>,
+    pub member_id: i64,
+    pub name: String,
+    pub coordinates: Coordinates,
+    pub state: State,
+    pub note: Option<String>,
+    pub source_url: Option<String>,
+    pub external_identifier: Option<String>,
+    pub google_maps_payload: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The filters [`list`] narrows by; every set one applies.
+#[derive(Default)]
+pub struct Filters {
+    /// Only these states; an empty list keeps every state.
+    pub states: Vec<State>,
+    /// Only this place type.
+    pub place_type_id: Option<i64>,
+    /// Only positions inside this box, both axes inclusive.
+    pub bounding_box: Option<BoundingBox>,
+}
+
+/// A range of positions on the map.
+#[derive(Clone, Copy, Debug)]
+pub struct BoundingBox {
+    pub min_lat: f64,
+    pub max_lat: f64,
+    pub min_lng: f64,
+    pub max_lng: f64,
+}
+
+/// The relocation's locations, in the order they were added, narrowed by
+/// the set filters. Listing is a read: an archived relocation still
+/// lists its locations.
+pub async fn list(
+    pool: &SqlitePool,
+    relocation_id: i64,
+    filters: &Filters,
+) -> Result<Vec<Location>, LocationError> {
+    let mut sql = String::from(
+        "SELECT id, relocation_id, place_type_id, member_id, name, lat, lon, state, note,
+                source_url, external_identifier, google_maps_payload, created_at, updated_at
+         FROM locations WHERE relocation_id = ?",
+    );
+    if !filters.states.is_empty() {
+        let placeholders = vec!["?"; filters.states.len()].join(", ");
+        sql.push_str(&format!(" AND state IN ({placeholders})"));
+    }
+    if filters.place_type_id.is_some() {
+        sql.push_str(" AND place_type_id = ?");
+    }
+    if filters.bounding_box.is_some() {
+        sql.push_str(" AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?");
+    }
+    sql.push_str(" ORDER BY id");
+
+    let mut query = sqlx::query_as::<_, LocationRow>(&sql).bind(relocation_id);
+    for state in &filters.states {
+        query = query.bind(state.as_str());
+    }
+    if let Some(place_type_id) = filters.place_type_id {
+        query = query.bind(place_type_id);
+    }
+    if let Some(bounding_box) = filters.bounding_box {
+        query = query
+            .bind(bounding_box.min_lat)
+            .bind(bounding_box.max_lat)
+            .bind(bounding_box.min_lng)
+            .bind(bounding_box.max_lng);
+    }
+    let rows = query.fetch_all(pool).await?;
+    rows.into_iter().map(LocationRow::into_location).collect()
+}
+
+/// One raw `locations` row as sqlx reads it, its state still a string.
+#[derive(sqlx::FromRow)]
+struct LocationRow {
+    id: i64,
+    relocation_id: i64,
+    place_type_id: Option<i64>,
+    member_id: i64,
+    name: String,
+    lat: f64,
+    lon: f64,
+    state: String,
+    note: Option<String>,
+    source_url: Option<String>,
+    external_identifier: Option<String>,
+    google_maps_payload: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl LocationRow {
+    /// The row with its state parsed; a stored state outside the
+    /// schema's CHECK constraint is an error, not a panic.
+    fn into_location(self) -> Result<Location, LocationError> {
+        Ok(Location {
+            id: self.id,
+            relocation_id: self.relocation_id,
+            place_type_id: self.place_type_id,
+            member_id: self.member_id,
+            name: self.name,
+            coordinates: Coordinates {
+                lat: self.lat,
+                lng: self.lon,
+            },
+            state: State::from_str(&self.state)?,
+            note: self.note,
+            source_url: self.source_url,
+            external_identifier: self.external_identifier,
+            google_maps_payload: self.google_maps_payload,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
 /// The relocation's city, or the refusal for an unknown or archived
 /// relocation.
 async fn relocation_city(pool: &SqlitePool, relocation_id: i64) -> Result<City, LocationError> {

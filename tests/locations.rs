@@ -13,7 +13,10 @@ use nexthome::{
     api_usage::Caps,
     geo::Coordinates,
     google_maps::GoogleMapsClient,
-    locations::{self, LocationChanges, LocationError, NewLocation, Placement, State},
+    locations::{
+        self, BoundingBox, Filters, Location, LocationChanges, LocationError, NewLocation,
+        Placement, State,
+    },
     mapbox::MapboxClient,
     relocations,
 };
@@ -227,6 +230,44 @@ async fn insert_isochrone(pool: &SqlitePool, location_id: i64) {
         .execute(pool)
         .await
         .unwrap();
+}
+
+/// A location row inserted straight into the table, bypassing the add
+/// paths, so the listing tests can seed many rows cheaply.
+async fn insert_location(
+    pool: &SqlitePool,
+    relocation_id: i64,
+    place_type_id: Option<i64>,
+    name: &str,
+    lat: f64,
+    lon: f64,
+    state: &str,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO locations (relocation_id, place_type_id, member_id, name, lat, lon, state,
+                                created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?,
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+         RETURNING id",
+    )
+    .bind(relocation_id)
+    .bind(place_type_id)
+    .bind(first_member_id(pool).await)
+    .bind(name)
+    .bind(lat)
+    .bind(lon)
+    .bind(state)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The listed locations' names, in list order.
+fn names(locations: &[Location]) -> Vec<&str> {
+    locations
+        .iter()
+        .map(|location| location.name.as_str())
+        .collect()
 }
 
 #[test]
@@ -1116,5 +1157,186 @@ async fn an_archived_relocation_refuses_every_location_write() {
         location_count(&pool, relocation_id).await,
         1,
         "the archived relocation keeps every location it had"
+    );
+}
+
+#[tokio::test]
+async fn listing_narrows_by_state_place_type_and_bounding_box() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let member_id = first_member_id(&pool).await;
+    let school_id = place_type_id(&pool, relocation_id, "School").await;
+    let gym_id = place_type_id(&pool, relocation_id, "Gym").await;
+    let home = insert_location(
+        &pool,
+        relocation_id,
+        Some(school_id),
+        "Home",
+        52.52,
+        13.405,
+        "inbox",
+    )
+    .await;
+    let office = insert_location(
+        &pool,
+        relocation_id,
+        Some(school_id),
+        "Alex office",
+        52.53,
+        13.41,
+        "accepted",
+    )
+    .await;
+    let gym = insert_location(
+        &pool,
+        relocation_id,
+        Some(gym_id),
+        "Urban Apes",
+        52.54,
+        13.42,
+        "inbox",
+    )
+    .await;
+    let flat = insert_location(
+        &pool,
+        relocation_id,
+        None,
+        "Wunderflats flat",
+        52.55,
+        13.43,
+        "booked",
+    )
+    .await;
+
+    // A location under another relocation never appears.
+    let account_id: i64 = sqlx::query_scalar("SELECT account_id FROM relocations WHERE id = ?")
+        .bind(relocation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let vienna_id = relocations::create(&pool, account_id, "Vienna", 48.208, 16.373, 11.0)
+        .await
+        .unwrap();
+    insert_location(&pool, vienna_id, None, "Vienna flat", 48.2, 16.37, "inbox").await;
+
+    // No filters: the relocation's locations in the order they were
+    // added.
+    let all = locations::list(&pool, relocation_id, &Filters::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(|location| location.id).collect::<Vec<_>>(),
+        vec![home, office, gym, flat]
+    );
+
+    // One row whole, field by field.
+    let office = &all[1];
+    assert_eq!(office.id, all[1].id);
+    assert_eq!(office.relocation_id, relocation_id);
+    assert_eq!(office.place_type_id, Some(school_id));
+    assert_eq!(office.member_id, member_id);
+    assert_eq!(office.name, "Alex office");
+    assert_eq!(
+        office.coordinates,
+        Coordinates {
+            lat: 52.53,
+            lng: 13.41,
+        }
+    );
+    assert_eq!(office.state, State::Accepted);
+    assert!(office.note.is_none());
+    assert!(office.source_url.is_none());
+    assert!(office.external_identifier.is_none());
+    assert!(office.google_maps_payload.is_none());
+
+    let inbox = locations::list(
+        &pool,
+        relocation_id,
+        &Filters {
+            states: vec![State::Inbox],
+            ..Filters::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(names(&inbox), ["Home", "Urban Apes"]);
+
+    let inbox_and_accepted = locations::list(
+        &pool,
+        relocation_id,
+        &Filters {
+            states: vec![State::Inbox, State::Accepted],
+            ..Filters::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        names(&inbox_and_accepted),
+        ["Home", "Alex office", "Urban Apes"]
+    );
+
+    let gyms = locations::list(
+        &pool,
+        relocation_id,
+        &Filters {
+            place_type_id: Some(gym_id),
+            ..Filters::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(names(&gyms), ["Urban Apes"]);
+
+    let near_the_centre = locations::list(
+        &pool,
+        relocation_id,
+        &Filters {
+            bounding_box: Some(BoundingBox {
+                min_lat: 52.51,
+                max_lat: 52.535,
+                min_lng: 13.4,
+                max_lng: 13.415,
+            }),
+            ..Filters::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(names(&near_the_centre), ["Home", "Alex office"]);
+
+    let inbox_schools = locations::list(
+        &pool,
+        relocation_id,
+        &Filters {
+            states: vec![State::Inbox],
+            place_type_id: Some(school_id),
+            ..Filters::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(names(&inbox_schools), ["Home"]);
+}
+
+#[tokio::test]
+async fn listing_reads_an_archived_relocation() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    insert_location(&pool, relocation_id, None, "Home", 52.52, 13.405, "inbox").await;
+    sqlx::query(
+        "UPDATE relocations SET archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+    )
+    .bind(relocation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let listed = locations::list(&pool, relocation_id, &Filters::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        names(&listed),
+        ["Home"],
+        "archived relocations are read-only, not unreadable"
     );
 }
