@@ -312,7 +312,7 @@ fn difference(big: &Value, small: &Value) -> Value {
 /// features' rings, holes kept as holes and every ring wound the way
 /// the set operations read — exterior counter-clockwise. Features of
 /// any other geometry are skipped; Mapbox isochrones are polygons.
-fn polygons(geojsons: &[&Value]) -> Vec<Polygon<f64>> {
+pub(crate) fn polygons(geojsons: &[&Value]) -> Vec<Polygon<f64>> {
     geojsons
         .iter()
         .flat_map(|geojson| {

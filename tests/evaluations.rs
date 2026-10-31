@@ -135,6 +135,43 @@ fn recorded_matrix_destinations(transport: &FakeTransport) -> Vec<String> {
         .collect()
 }
 
+/// Stores one walking contour for the location, as the isochrones job
+/// would have: the geojson verbatim, at the contour's minutes.
+async fn store_contour(pool: &SqlitePool, location_id: i64, minutes: i64, geojson: &str) {
+    sqlx::query("INSERT INTO isochrones (location_id, minutes, geojson) VALUES (?, ?, ?)")
+        .bind(location_id)
+        .bind(minutes)
+        .bind(geojson)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// A square walking contour as Mapbox-shaped GeoJSON: the axis-aligned
+/// square of the half-width around the centre, the shape the isochrone
+/// fixtures' polygons take.
+fn square_contour(center: (f64, f64), half_width: f64) -> String {
+    let (x, y) = center;
+    let ring = [
+        (x - half_width, y - half_width),
+        (x + half_width, y - half_width),
+        (x + half_width, y + half_width),
+        (x - half_width, y + half_width),
+        (x - half_width, y - half_width),
+    ]
+    .into_iter()
+    .map(|(ring_x, ring_y)| json!([ring_x, ring_y]))
+    .collect::<Vec<_>>();
+    json!({
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "geometry": {"type": "Polygon", "coordinates": [ring]}
+        }]
+    })
+    .to_string()
+}
+
 /// Scripts one Distance Matrix answer: one origin, every destination
 /// in order, `seconds` of travel each, or an unreachable pair when
 /// None.
@@ -463,6 +500,79 @@ async fn the_second_call_reads_the_stored_table_and_makes_no_request() {
             .await
             .unwrap();
     assert_eq!(evaluations_stored, 1);
+}
+
+#[tokio::test]
+async fn the_walking_band_comes_from_the_destination_s_stored_isochrones() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let school = place_type_id(&pool, relocation_id, "School").await;
+    let apartment = place_type_id(&pool, relocation_id, "Apartment").await;
+    // One accepted school with its walking contours stored: the
+    // recorded fixture polygon at 5 minutes, squares around it at 10
+    // and 30 — nested, the way generated contours nest.
+    let center = (13.4105, 52.5116);
+    let destination = insert_location(
+        &pool,
+        relocation_id,
+        Some(school),
+        "Grundschule Neumark",
+        center.1,
+        center.0,
+        "accepted",
+    )
+    .await;
+    store_contour(&pool, destination, 5, &fixture("mapbox_isochrone.json")).await;
+    store_contour(&pool, destination, 10, &square_contour(center, 0.02)).await;
+    store_contour(&pool, destination, 30, &square_contour(center, 0.05)).await;
+
+    // Four flats, each in another walking band of the same school:
+    // inside the recorded 5-minute polygon; inside the 10-minute square
+    // but past the polygon; inside the 30-minute square but past the
+    // 10-minute one; past every contour. The matrix answers no route to
+    // any of them, so the walking band is the only time a row carries.
+    let positions = [
+        (52.5116, 13.4105, Some(5)),
+        (52.5116, 13.428, Some(10)),
+        (52.5116, 13.45, Some(30)),
+        (52.5116, 13.48, None),
+    ];
+    for (lat, lng, walk) in positions {
+        for _ in 0..3 {
+            push_matrix(&transport, &[None]);
+        }
+        let flat = insert_location(
+            &pool,
+            relocation_id,
+            Some(apartment),
+            &format!("Flat at {lng}"),
+            lat,
+            lng,
+            "inbox",
+        )
+        .await;
+
+        let table = evaluate(&pool, &transport, relocation_id, flat)
+            .await
+            .unwrap();
+
+        let rows = stored_rows(&pool, flat).await;
+        assert_eq!(rows.len(), 1, "the school is the type's one accepted place");
+        assert_eq!(rows[0].walk, walk, "the walking band at lng {lng}");
+        assert_eq!(rows[0].bike, None);
+        assert_eq!(rows[0].transit, None);
+        assert_eq!(rows[0].car, None);
+        match walk {
+            Some(_) => assert!(
+                table.contains("School: Grundschule Neumark"),
+                "the row renders on its walking band alone: {table}"
+            ),
+            None => assert!(
+                table.contains("School: none within 30 min by any mode"),
+                "past every contour and no route, nothing renders: {table}"
+            ),
+        }
+    }
 }
 
 #[tokio::test]

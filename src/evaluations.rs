@@ -7,13 +7,15 @@
 
 use std::fmt::{self, Write as _};
 
-use geo::{Distance, Haversine, Point};
+use geo::{Contains, Distance, Haversine, Point};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::SqlitePool;
 
 use crate::{
     geo::Coordinates,
     google_maps::{GoogleMapsClient, GoogleMapsError, TravelMode},
+    isochrones,
 };
 
 /// One row of a stored evaluation: one of a place type's nearest
@@ -216,7 +218,8 @@ struct NearestPlace {
 
 /// The evaluation's rows: per place type, its nearest accepted places —
 /// the three nearest by straight-line distance, the evaluated location
-/// itself never one of them — each carrying the bike, transit and car
+/// itself never one of them — each carrying its walking band from the
+/// destination's stored isochrones and the bike, transit and car
 /// minutes one batched matrix request per mode answers for them all.
 async fn compute(
     pool: &SqlitePool,
@@ -245,19 +248,52 @@ async fn compute(
     } else {
         matrix_minutes(google, location.coordinates, &destinations).await?
     };
+    let position = point(location.coordinates);
     let mut rows = Vec::with_capacity(entries.len());
     for ((place_type, place), minutes) in entries.iter().zip(matrix) {
         rows.push(EvaluationRow {
             place_type: (*place_type).to_owned(),
             destination_location_id: place.id,
             destination: place.name.clone(),
-            walk: None,
+            walk: walk_minutes(pool, place.id, position).await?,
             bike: minutes.bike,
             transit: minutes.transit,
             car: minutes.car,
         });
     }
     Ok(rows)
+}
+
+/// The walking minutes from the position to the destination: the
+/// smallest walking isochrone the destination has stored whose polygon
+/// contains the position — a position inside the 10-minute contour but
+/// not the 5-minute one walks in at most 10, the five-minute band above
+/// the smaller contour. None when no contour contains the position:
+/// past them all, or none stored. A contour whose geojson does not
+/// parse takes part in no band.
+async fn walk_minutes(
+    pool: &SqlitePool,
+    destination_id: i64,
+    position: Point<f64>,
+) -> Result<Option<u32>, EvaluationError> {
+    let contours: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT minutes, geojson FROM isochrones WHERE location_id = ? ORDER BY minutes",
+    )
+    .bind(destination_id)
+    .fetch_all(pool)
+    .await?;
+    for (minutes, geojson) in contours {
+        let Ok(geojson) = serde_json::from_str::<Value>(&geojson) else {
+            continue;
+        };
+        if isochrones::polygons(&[&geojson])
+            .iter()
+            .any(|polygon| polygon.contains(&position))
+        {
+            return Ok(Some(minutes as u32));
+        }
+    }
+    Ok(None)
 }
 
 /// The place type's three nearest accepted places to the position, by
