@@ -4,7 +4,7 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 
 use crate::{
-    api_usage::{self, Provider},
+    api_usage::{self, Caps, Provider},
     geo::Coordinates,
     http::{self, HttpResponse, HttpTransport},
 };
@@ -21,6 +21,9 @@ pub enum MapboxError {
     Transport(http::TransportError),
     /// Counting the request in `api_usage` failed.
     Usage(sqlx::Error),
+    /// A configured monthly cap refused the request, or reading the usage
+    /// behind the check failed.
+    Cap(api_usage::CapError),
     /// The response body was not the JSON Mapbox sends.
     Unparseable(serde_json::Error),
     /// Geocoding answered no feature for the address.
@@ -36,6 +39,7 @@ impl fmt::Display for MapboxError {
             Self::Usage(error) => {
                 write!(formatter, "counting the call in api_usage failed: {error}")
             }
+            Self::Cap(error) => write!(formatter, "{error}"),
             Self::Unparseable(error) => {
                 write!(formatter, "Mapbox answered unparseable JSON: {error}")
             }
@@ -54,6 +58,7 @@ impl std::error::Error for MapboxError {
         match self {
             Self::Transport(error) => Some(error),
             Self::Usage(error) => Some(error),
+            Self::Cap(error) => Some(error),
             Self::Unparseable(error) => Some(error),
             _ => None,
         }
@@ -61,12 +66,14 @@ impl std::error::Error for MapboxError {
 }
 
 /// The Mapbox client for one relocation: geocoding and isochrones through an
-/// injectable transport, every request counted in `api_usage`.
+/// injectable transport, every request gated by the configured caps and
+/// counted in `api_usage`.
 pub struct MapboxClient<'a> {
     pub transport: &'a dyn HttpTransport,
     pub pool: &'a SqlitePool,
     pub relocation_id: i64,
     pub access_token: &'a str,
+    pub caps: Caps,
 }
 
 impl MapboxClient<'_> {
@@ -136,9 +143,12 @@ impl MapboxClient<'_> {
         }
     }
 
-    /// One counted request: bumps `api_usage` first, then GETs through the
-    /// transport-level retry.
+    /// One counted request: refuses past a configured cap, bumps
+    /// `api_usage`, then GETs through the transport-level retry.
     async fn get(&self, url: &str, params: &[(&str, String)]) -> Result<HttpResponse, MapboxError> {
+        api_usage::check_cap(self.pool, self.relocation_id, Provider::Mapbox, self.caps)
+            .await
+            .map_err(MapboxError::Cap)?;
         api_usage::record_request(self.pool, self.relocation_id, Provider::Mapbox)
             .await
             .map_err(MapboxError::Usage)?;
