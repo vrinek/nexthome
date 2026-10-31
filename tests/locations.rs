@@ -13,7 +13,7 @@ use nexthome::{
     api_usage::Caps,
     geo::Coordinates,
     google_maps::GoogleMapsClient,
-    locations::{self, LocationError, NewLocation, Placement, State},
+    locations::{self, LocationChanges, LocationError, NewLocation, Placement, State},
     mapbox::MapboxClient,
     relocations,
 };
@@ -165,6 +165,68 @@ async fn location_row(pool: &SqlitePool, location_id: i64) -> LocationRow {
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+/// A location created straight from coordinates at the city's position:
+/// the quietest create path, no provider calls, one isochrones job.
+async fn add_at_coordinates(
+    pool: &SqlitePool,
+    transport: &FakeTransport,
+    relocation_id: i64,
+    member_id: i64,
+    place_type_id: i64,
+    name: &str,
+) -> i64 {
+    add_location(
+        pool,
+        transport,
+        relocation_id,
+        member_id,
+        NewLocation {
+            name,
+            place_type_id,
+            note: None,
+            source_url: None,
+            placement: Placement::Coordinates(Coordinates {
+                lat: 52.52,
+                lng: 13.405,
+            }),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// A stored evaluation for the location, as the evaluation task will
+/// write them.
+async fn insert_evaluation(pool: &SqlitePool, location_id: i64) {
+    sqlx::query(
+        "INSERT INTO evaluations (location_id, computed_at, rows)
+         VALUES (?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), '[]')",
+    )
+    .bind(location_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// How many evaluations stand stored for the location.
+async fn evaluation_count(pool: &SqlitePool, location_id: i64) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM evaluations WHERE location_id = ?")
+        .bind(location_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A stored isochrone for the location, as the isochrones task will
+/// write them.
+async fn insert_isochrone(pool: &SqlitePool, location_id: i64) {
+    sqlx::query("INSERT INTO isochrones (location_id, minutes, geojson) VALUES (?, 10, '{}')")
+        .bind(location_id)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -790,5 +852,269 @@ async fn adding_refuses_an_unknown_relocation() {
     assert!(
         matches!(error, LocationError::RelocationNotFound),
         "expected a relocation-not-found refusal, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn updating_state_note_and_name_leaves_the_position_jobs_and_evaluations_alone() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let member_id = first_member_id(&pool).await;
+    let school_id = place_type_id(&pool, relocation_id, "School").await;
+    let location_id = add_at_coordinates(
+        &pool,
+        &transport,
+        relocation_id,
+        member_id,
+        school_id,
+        "Home",
+    )
+    .await;
+    insert_evaluation(&pool, location_id).await;
+
+    locations::update(
+        &pool,
+        relocation_id,
+        location_id,
+        LocationChanges {
+            state: Some(State::Accepted),
+            note: Some("great light"),
+            name: Some("Home, Mitte"),
+            coordinates: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (_, _, _, name, lat, lon, state, note, ..) = location_row(&pool, location_id).await;
+    assert_eq!(name, "Home, Mitte");
+    assert_eq!((lat, lon), (52.52, 13.405));
+    assert_eq!(state, "accepted");
+    assert_eq!(note.as_deref(), Some("great light"));
+    assert_eq!(isochrones_job_count(&pool, location_id).await, 1);
+    assert_eq!(evaluation_count(&pool, location_id).await, 1);
+}
+
+#[tokio::test]
+async fn moving_a_location_enqueues_isochrones_again_and_deletes_its_evaluation() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let member_id = first_member_id(&pool).await;
+    let school_id = place_type_id(&pool, relocation_id, "School").await;
+    let location_id = add_at_coordinates(
+        &pool,
+        &transport,
+        relocation_id,
+        member_id,
+        school_id,
+        "Home",
+    )
+    .await;
+    insert_evaluation(&pool, location_id).await;
+
+    locations::update(
+        &pool,
+        relocation_id,
+        location_id,
+        LocationChanges {
+            state: None,
+            note: None,
+            name: None,
+            coordinates: Some(Coordinates {
+                lat: 52.534,
+                lng: 13.412,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (_, _, _, _, lat, lon, ..) = location_row(&pool, location_id).await;
+    assert_eq!((lat, lon), (52.534, 13.412));
+    assert_eq!(
+        isochrones_job_count(&pool, location_id).await,
+        2,
+        "the move queues a fresh isochrones job"
+    );
+    assert_eq!(
+        evaluation_count(&pool, location_id).await,
+        0,
+        "the move invalidates the stored evaluation"
+    );
+}
+
+#[tokio::test]
+async fn updating_or_deleting_refuses_a_location_outside_its_relocation() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let member_id = first_member_id(&pool).await;
+    let school_id = place_type_id(&pool, relocation_id, "School").await;
+    let location_id = add_at_coordinates(
+        &pool,
+        &transport,
+        relocation_id,
+        member_id,
+        school_id,
+        "Home",
+    )
+    .await;
+
+    let account_id: i64 = sqlx::query_scalar("SELECT account_id FROM relocations WHERE id = ?")
+        .bind(relocation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let vienna_id = relocations::create(&pool, account_id, "Vienna", 48.208, 16.373, 11.0)
+        .await
+        .unwrap();
+
+    let reject = LocationChanges {
+        state: Some(State::Rejected),
+        ..LocationChanges::default()
+    };
+    let error = locations::update(&pool, vienna_id, location_id, reject)
+        .await
+        .expect_err("the location belongs to another relocation");
+    assert!(
+        matches!(error, LocationError::LocationNotFound),
+        "expected a location-not-found refusal, got: {error}"
+    );
+
+    let error = locations::delete(&pool, vienna_id, location_id)
+        .await
+        .expect_err("the location belongs to another relocation");
+    assert!(
+        matches!(error, LocationError::LocationNotFound),
+        "expected a location-not-found refusal, got: {error}"
+    );
+    assert_eq!(
+        location_count(&pool, relocation_id).await,
+        1,
+        "a refusal deletes nothing"
+    );
+
+    let error = locations::update(&pool, 999, location_id, LocationChanges::default())
+        .await
+        .expect_err("no relocation has id 999");
+    assert!(
+        matches!(error, LocationError::RelocationNotFound),
+        "expected a relocation-not-found refusal, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_location_takes_its_isochrones_and_evaluation_with_it() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let member_id = first_member_id(&pool).await;
+    let school_id = place_type_id(&pool, relocation_id, "School").await;
+    let location_id = add_at_coordinates(
+        &pool,
+        &transport,
+        relocation_id,
+        member_id,
+        school_id,
+        "Home",
+    )
+    .await;
+    insert_evaluation(&pool, location_id).await;
+    insert_isochrone(&pool, location_id).await;
+
+    locations::delete(&pool, relocation_id, location_id)
+        .await
+        .unwrap();
+
+    assert_eq!(location_count(&pool, relocation_id).await, 0);
+    assert_eq!(evaluation_count(&pool, location_id).await, 0);
+    let isochrones: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM isochrones WHERE location_id = ?")
+            .bind(location_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(isochrones, 0);
+
+    let error = locations::delete(&pool, relocation_id, location_id)
+        .await
+        .expect_err("the location is already gone");
+    assert!(
+        matches!(error, LocationError::LocationNotFound),
+        "expected a location-not-found refusal, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn an_archived_relocation_refuses_every_location_write() {
+    let (_directory, pool, relocation_id) = relocated_pool().await;
+    let transport = FakeTransport::new();
+    let member_id = first_member_id(&pool).await;
+    let school_id = place_type_id(&pool, relocation_id, "School").await;
+    let location_id = add_at_coordinates(
+        &pool,
+        &transport,
+        relocation_id,
+        member_id,
+        school_id,
+        "Home",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE relocations SET archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+    )
+    .bind(relocation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = add_location(
+        &pool,
+        &transport,
+        relocation_id,
+        member_id,
+        NewLocation {
+            name: "Another",
+            place_type_id: school_id,
+            note: None,
+            source_url: None,
+            placement: Placement::Coordinates(Coordinates {
+                lat: 52.52,
+                lng: 13.405,
+            }),
+        },
+    )
+    .await
+    .expect_err("an archived relocation is read-only");
+    assert!(
+        matches!(error, LocationError::Archived),
+        "expected an archive refusal, got: {error}"
+    );
+
+    let error = locations::update(
+        &pool,
+        relocation_id,
+        location_id,
+        LocationChanges {
+            state: Some(State::Booked),
+            ..LocationChanges::default()
+        },
+    )
+    .await
+    .expect_err("an archived relocation is read-only");
+    assert!(
+        matches!(error, LocationError::Archived),
+        "expected an archive refusal, got: {error}"
+    );
+
+    let error = locations::delete(&pool, relocation_id, location_id)
+        .await
+        .expect_err("an archived relocation is read-only");
+    assert!(
+        matches!(error, LocationError::Archived),
+        "expected an archive refusal, got: {error}"
+    );
+    assert_eq!(
+        location_count(&pool, relocation_id).await,
+        1,
+        "the archived relocation keeps every location it had"
     );
 }

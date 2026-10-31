@@ -306,6 +306,110 @@ pub async fn add(
     Ok(location_id)
 }
 
+/// The fields an update may change; each None leaves the field as it
+/// stands.
+#[derive(Default)]
+pub struct LocationChanges<'a> {
+    pub state: Option<State>,
+    pub note: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub coordinates: Option<Coordinates>,
+}
+
+/// Updates a location's state, note, name or position. Moving it — new
+/// coordinates — re-enqueues its isochrones job and deletes its stored
+/// evaluation, which the move has invalidated. The write goes through
+/// the archive guard and stays scoped: a location of another relocation
+/// is not found.
+pub async fn update(
+    pool: &SqlitePool,
+    relocation_id: i64,
+    location_id: i64,
+    changes: LocationChanges<'_>,
+) -> Result<(), LocationError> {
+    let moved = changes.coordinates.is_some();
+    let mut transaction = pool.begin().await?;
+    relocations::ensure_writable(&mut *transaction, relocation_id).await?;
+
+    let mut assignments = vec!["updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"];
+    if changes.state.is_some() {
+        assignments.push("state = ?");
+    }
+    if changes.note.is_some() {
+        assignments.push("note = ?");
+    }
+    if changes.name.is_some() {
+        assignments.push("name = ?");
+    }
+    if moved {
+        assignments.extend(["lat = ?", "lon = ?"]);
+    }
+    let sql = format!(
+        "UPDATE locations SET {} WHERE id = ? AND relocation_id = ?",
+        assignments.join(", ")
+    );
+    let mut query = sqlx::query(&sql);
+    if let Some(state) = changes.state {
+        query = query.bind(state.as_str());
+    }
+    if let Some(note) = changes.note {
+        query = query.bind(note);
+    }
+    if let Some(name) = changes.name {
+        query = query.bind(name);
+    }
+    if let Some(coordinates) = changes.coordinates {
+        query = query.bind(coordinates.lat).bind(coordinates.lng);
+    }
+    let result = query
+        .bind(location_id)
+        .bind(relocation_id)
+        .execute(&mut *transaction)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(LocationError::LocationNotFound);
+    }
+
+    if moved {
+        jobs::enqueue_isochrones(&mut *transaction, location_id).await?;
+        sqlx::query("DELETE FROM evaluations WHERE location_id = ?")
+            .bind(location_id)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Deletes a location, with the isochrones and the evaluation that hang
+/// off it, through the archive guard and scoped to the relocation.
+pub async fn delete(
+    pool: &SqlitePool,
+    relocation_id: i64,
+    location_id: i64,
+) -> Result<(), LocationError> {
+    let mut transaction = pool.begin().await?;
+    relocations::ensure_writable(&mut *transaction, relocation_id).await?;
+    sqlx::query("DELETE FROM evaluations WHERE location_id = ?")
+        .bind(location_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM isochrones WHERE location_id = ?")
+        .bind(location_id)
+        .execute(&mut *transaction)
+        .await?;
+    let result = sqlx::query("DELETE FROM locations WHERE id = ? AND relocation_id = ?")
+        .bind(location_id)
+        .bind(relocation_id)
+        .execute(&mut *transaction)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(LocationError::LocationNotFound);
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 /// The relocation's city, or the refusal for an unknown or archived
 /// relocation.
 async fn relocation_city(pool: &SqlitePool, relocation_id: i64) -> Result<City, LocationError> {
