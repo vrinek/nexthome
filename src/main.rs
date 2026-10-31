@@ -1,7 +1,7 @@
 use std::{env, error::Error, str::FromStr, time::Duration};
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
-use nexthome::auth::AuthenticatedMember;
+use nexthome::{auth::AuthenticatedMember, jobs};
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .connect_with(options)
         .await?;
     sqlx::migrate!().run(&pool).await?;
+    tokio::spawn(jobs::run(pool.clone()));
 
     let app = Router::new()
         .route("/healthz", get(healthz))

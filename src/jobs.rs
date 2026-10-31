@@ -2,7 +2,7 @@
 //! atomic claim the loop claims through — one job at a time — and the
 //! three job kinds it runs.
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -32,6 +32,10 @@ const CLAIM_LEASE_SECONDS: i64 = 600;
 /// The seconds to wait before the next attempt, by the attempt that just
 /// failed: ten seconds after the first, doubling each time.
 const RETRY_BACKOFF_SECONDS: [i64; 4] = [10, 20, 40, 80];
+
+/// How long the loop waits between polls when no job is due, so a fresh
+/// job starts within a second of becoming due.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Why a job run failed; the message lands in the job's `last_error`.
 #[derive(Debug)]
@@ -294,4 +298,22 @@ fn number_field(payload: &Value, name: &str) -> Result<f64, JobError> {
     payload[name]
         .as_f64()
         .ok_or_else(|| JobError::Payload(format!("the {name} field must be a number")))
+}
+
+/// The background loop: one job at a time — claim, run, record — sleeping
+/// a poll interval whenever no job is due or the database errs. The plan
+/// keeps one process the only writer, and this loop is the only claimer
+/// in it, so jobs never run concurrently. Runs forever; the server
+/// spawns it at startup.
+pub async fn run(pool: SqlitePool) {
+    loop {
+        match process_next(&pool).await {
+            Ok(true) => {}
+            Ok(false) => tokio::time::sleep(POLL_INTERVAL).await,
+            Err(error) => {
+                tracing::warn!(%error, "looking for the next job failed");
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+    }
 }

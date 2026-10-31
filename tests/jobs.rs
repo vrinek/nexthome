@@ -1,5 +1,7 @@
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::{migrated_pool, relocated_pool};
 use nexthome::jobs;
 use sqlx::SqlitePool;
@@ -306,4 +308,31 @@ async fn an_unknown_kind_or_a_bad_payload_fails_the_job_with_the_reason() {
             .1
             .starts_with("malformed payload: payload is not valid JSON")
     );
+}
+
+#[tokio::test]
+async fn the_loop_runs_due_jobs_to_completion() {
+    let (_directory, pool) = migrated_pool().await;
+    jobs::enqueue_archive_expired(&pool).await.unwrap();
+    jobs::enqueue_archive_expired(&pool).await.unwrap();
+
+    tokio::spawn(jobs::run(pool.clone()));
+
+    // The loop polls every second, so both jobs should be done well
+    // inside ten.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE done_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if done == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the loop did not finish both jobs within ten seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
